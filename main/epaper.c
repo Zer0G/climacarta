@@ -505,6 +505,43 @@ esp_err_t epaper_show(const epaper_view_t *view)
     return present_framebuffer();
 }
 
+esp_err_t epaper_show_ota_progress(uint8_t percent, const char *status)
+{
+    if (percent > 100U) percent = 100U;
+    if (!status) status = "UPDATING";
+    ESP_RETURN_ON_ERROR(prepare_display(), TAG, "display init");
+    memset(s_framebuffer, 0xff, sizeof(s_framebuffer));
+    text_bold_centered(28, "FIRMWARE OTA", 2);
+    text_centered(58, status, 1);
+    char line[8];
+    snprintf(line, sizeof(line), "%u%%", percent);
+    text_bold_centered(78, line, 3);
+
+    const int left = 18;
+    const int right = EPD_WIDTH - 18;
+    const int top = 126;
+    const int bottom = 140;
+    for (int x = left; x <= right; ++x) {
+        pixel(x, top, true);
+        pixel(x, top + 1, true);
+        pixel(x, bottom, true);
+        pixel(x, bottom - 1, true);
+    }
+    for (int y = top; y <= bottom; ++y) {
+        pixel(left, y, true);
+        pixel(left + 1, y, true);
+        pixel(right, y, true);
+        pixel(right - 1, y, true);
+    }
+    const int fill_right = left + 4 + ((right - left - 8) * percent) / 100;
+    for (int y = top + 4; y < bottom - 3; ++y) {
+        for (int x = left + 4; x <= fill_right; ++x) {
+            pixel(x, y, true);
+        }
+    }
+    return present_framebuffer();
+}
+
 static void provisioning_qr(esp_qrcode_handle_t qrcode)
 {
     const int size = esp_qrcode_get_size(qrcode);

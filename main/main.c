@@ -53,13 +53,28 @@ typedef struct {
 RTC_DATA_ATTR static persistent_state_t s_state;
 static const char *TAG = "rht_sensor";
 
+static void ota_progress(int downloaded, int total)
+{
+    static int last_percent = -5;
+    int percent = 0;
+    if (total > 0 && downloaded > 0) {
+        percent = (downloaded * 100) / total;
+        if (percent > 100) percent = 100;
+    }
+    if (percent < 100 && percent - last_percent < 5) return;
+    last_percent = percent;
+    ESP_LOGI(TAG, "OTA progress: %d%% (%d/%d)", percent, downloaded, total);
+    (void)epaper_show_ota_progress((uint8_t)percent, "DOWNLOADING");
+}
+
 static void ota_task(void *arg)
 {
     TaskHandle_t waiter = (TaskHandle_t)arg;
     ESP_LOGI(TAG, "starting GitHub OTA update");
     ESP_LOGI(TAG, "OTA task stack free before download: %u bytes",
              (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
-    const esp_err_t ota_result = ota_install_from_github();
+    ota_progress(0, 0);
+    const esp_err_t ota_result = ota_install_from_github(ota_progress);
     ESP_LOGI(TAG, "OTA task stack free after download: %u bytes",
              (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
     if (ota_result == ESP_ERR_NOT_FOUND) {

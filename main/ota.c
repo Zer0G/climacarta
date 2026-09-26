@@ -191,7 +191,7 @@ esp_err_t ota_confirm_running_image(void)
     return result == ESP_ERR_NOT_FOUND ? ESP_OK : result;
 }
 
-esp_err_t ota_install_from_github(void)
+esp_err_t ota_install_from_github(ota_progress_cb_t progress_callback)
 {
     char manifest[OTA_MANIFEST_MAX_SIZE];
     char version[OTA_VERSION_MAX_SIZE];
@@ -241,8 +241,15 @@ esp_err_t ota_install_from_github(void)
     result = esp_https_ota_get_img_desc(handle, &image_desc);
     if (result == ESP_OK) {
         ESP_LOGI(TAG, "downloading firmware %s to %s", image_desc.version, target->label);
+        if (progress_callback) {
+            progress_callback(0, esp_https_ota_get_image_size(handle));
+        }
         do {
             result = esp_https_ota_perform(handle);
+            if (progress_callback) {
+                progress_callback(esp_https_ota_get_image_len_read(handle),
+                                  esp_https_ota_get_image_size(handle));
+            }
         } while (result == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
     }
     if (result == ESP_OK && !esp_https_ota_is_complete_data_received(handle)) {

@@ -31,5 +31,6 @@ typedef struct {
 } epaper_view_t;
 
 esp_err_t epaper_show(const epaper_view_t *view);
+esp_err_t epaper_show_ota_progress(uint8_t percent, const char *status);
 esp_err_t epaper_show_provisioning(const char *ap_ssid, const char *ap_password);
 void epaper_shutdown(void);
