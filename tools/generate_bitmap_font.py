@@ -10,10 +10,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "font" / "Meedori Sans Typeface" / "Meedori Sans Regular.ttf"
 OUTPUT = ROOT / "main" / "font_share_tech_mono.h"
 FIRST_CHAR = 32
-LAST_CHAR = 90
+LAST_CHAR = 122
 EXTRA_CHARACTERS = "°"
 STATUS_FONT_SIZE = 18
-FONT_SIZES = (17, 22, 30, 46)
+FONT_SIZES = (12, 18, 30, 46)
+HORIZONTAL_SCALE = 0.56
 
 
 def render_font(size: int):
@@ -22,16 +23,18 @@ def render_font(size: int):
     boxes = [font.getbbox(char) for char in characters if char != " "]
     top = min(box[1] for box in boxes)
     bottom = max(box[3] for box in boxes)
-    width = max(ceil(font.getlength(char)) for char in characters)
-    width = max(width, max(box[2] for box in boxes))
+    natural_width = max(ceil(font.getlength(char)) for char in characters)
+    natural_width = max(natural_width, max(box[2] for box in boxes))
+    width = max(1, round(natural_width * HORIZONTAL_SCALE))
     height = bottom - top
     stride = (width + 7) // 8
     output = bytearray()
 
     for char in characters:
-        image = Image.new("1", (width, height), 0)
+        image = Image.new("1", (natural_width, height), 0)
         draw = ImageDraw.Draw(image)
         draw.text((0, -top), char, font=font, fill=1)
+        image = image.resize((width, height), Image.Resampling.LANCZOS).convert("1")
         for y in range(height):
             for byte_x in range(stride):
                 value = 0

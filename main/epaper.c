@@ -236,24 +236,18 @@ static size_t text_cell_count(const char *value)
     return count;
 }
 
-static void text_bold(int x, int y, const char *value, int scale)
-{
-    if (scale < 1) {
-        scale = 1;
-    } else if (scale > 4) {
-        scale = 4;
-    }
-    const bitmap_font_t *font = s_share_tech_mono_fonts[scale - 1];
-    text_with_font(x, y, value, font);
-    text_with_font(x + 1, y, value, font);
-}
-
 static void text_bold_right(int right, int y, const char *value, const bitmap_font_t *font)
 {
     const int width = (int)text_cell_count(value) * font->width;
     const int x = right - width - 1;
     text_with_font(x, y, value, font);
     text_with_font(x + 1, y, value, font);
+}
+
+static void text_status_centered(int y, const char *value)
+{
+    const int width = (int)text_cell_count(value) * s_share_tech_mono_status.width;
+    text_with_font((EPD_WIDTH - width) / 2, y, value, &s_share_tech_mono_status);
 }
 
 static void text_centered(int y, const char *value, int scale)
@@ -339,11 +333,20 @@ static void line_segment(int x0, int y0, int x1, int y1)
     }
 }
 
+static void draw_arrow(int x, int y, bool up)
+{
+    const int tip = y + (up ? -5 : 5);
+    const int wing = y + (up ? -1 : 1);
+    line_segment(x, y - 5, x, y + 5);
+    line_segment(x, tip, x - 3, wing);
+    line_segment(x, tip, x + 3, wing);
+}
+
 static void history_chart(const float *values, uint8_t count)
 {
-    const int left = 105;
-    const int top = 143;
-    const int right = 198;
+    const int left = 17;
+    const int top = 106;
+    const int right = 190;
     const int bottom = 196;
     line_segment(left, top, right, top);
     line_segment(right, top, right, bottom);
@@ -385,14 +388,6 @@ static void history_chart(const float *values, uint8_t count)
     }
 }
 
-static void horizontal_line(int y)
-{
-    for (int x = 0; x < EPD_WIDTH; ++x) {
-        pixel(x, y, true);
-        pixel(x, y + 1, true);
-    }
-}
-
 static void render(const epaper_view_t *view)
 {
     memset(s_framebuffer, 0xff, sizeof(s_framebuffer));
@@ -401,51 +396,49 @@ static void render(const epaper_view_t *view)
     const unsigned battery_pct = view->battery_pct > 100U ? 100U : view->battery_pct;
     if (view->time_valid) {
         localtime_r(&view->timestamp, &local);
-        snprintf(line, sizeof(line), "%02d:%02d %02d/%02d/%02d",
-                 local.tm_hour, local.tm_min, local.tm_mday, local.tm_mon + 1,
+        snprintf(line, sizeof(line), "%02d/%02d/%02d",
+                 local.tm_mday, local.tm_mon + 1,
                  (local.tm_year + 1900) % 100);
     } else {
-        snprintf(line, sizeof(line), "--:-- --/--/--");
+        snprintf(line, sizeof(line), "--/--/--");
     }
     rssi_indicator(1, 1, view->rssi, view->wifi_connected);
-    text_with_font(18, 1, line, &s_share_tech_mono_status);
-    text_with_font(19, 1, line, &s_share_tech_mono_status);
+    text_status_centered(1, line);
     snprintf(line, sizeof(line), "%u%%", battery_pct);
     text_bold_right(200, 1, line, &s_share_tech_mono_status);
-    horizontal_line(20);
-
     if (view->page == 0) {
         snprintf(line, sizeof(line), "%.1f" "\xc2\xb0" "C", view->temperature_c);
-        text_bold_centered(24, line, 3);
-        snprintf(line, sizeof(line), "MIN %.1f MAX %.1f", view->day_min_c, view->day_max_c);
-        text_centered(60, line, 2);
-        snprintf(line, sizeof(line), "RH %.0f%%", view->humidity_pct);
-        text_bold_centered(86, line, 3);
-        snprintf(line, sizeof(line), "DEW %.1fC", view->dew_point_c);
-        text_centered(116, line, 1);
-        horizontal_line(137);
-        text_bold(4, 142, "DELTA HOUR", 1);
+        text_bold_centered(35, line, 3);
         if (view->delta_valid) {
-            snprintf(line, sizeof(line), "%+.1fC", view->delta_c);
+            snprintf(line, sizeof(line), "1h %.1f" "\xc2\xb0" "C", fabsf(view->delta_c));
         } else {
-            snprintf(line, sizeof(line), "NO DATA");
+            snprintf(line, sizeof(line), "1h n/d");
         }
-        text_centered(view->delta_valid ? 166 : 170, line, view->delta_valid ? 3 : 2);
+        text_centered(73, line, 1);
+        if (view->delta_valid) draw_arrow(138, 78, view->delta_c >= 0.0f);
+        snprintf(line, sizeof(line), "min %.1f" "\xc2\xb0" "C", view->day_min_c);
+        text_with_font(4, 101, line, s_share_tech_mono_fonts[0]);
+        snprintf(line, sizeof(line), "max %.1f" "\xc2\xb0" "C", view->day_max_c);
+        text_with_font(105, 101, line, s_share_tech_mono_fonts[0]);
+        snprintf(line, sizeof(line), "%.0f%%", view->humidity_pct);
+        text_bold_centered(127, line, 3);
+        snprintf(line, sizeof(line), "dew %.1f" "\xc2\xb0" "C", view->dew_point_c);
+        text_centered(170, line, 1);
     } else {
-        text_bold(4, 25, "HISTORY DELTAS", 1);
-        static const char *labels[] = {"DAY", "WEEK", "MONTH", "YEAR"};
-        for (size_t i = 0; i < 4; ++i) {
-            snprintf(line, sizeof(line), "%s", labels[i]);
-            text_bold(8, 45 + (int)i * 20, line, 1);
-            if (view->history_valid[i]) {
-                snprintf(line, sizeof(line), "%+.1fC", view->history_delta_c[i]);
-            } else {
-                snprintf(line, sizeof(line), "NO DATA");
-            }
-            text_bold_right(96, 45 + (int)i * 20, line, s_share_tech_mono_fonts[1]);
-        }
-        horizontal_line(128);
-        text_bold(4, 132, "BATTERY 30 DAYS", 1);
+        snprintf(line, sizeof(line), "1d %s", view->history_valid[0] ? "" : "n/d");
+        if (view->history_valid[0]) snprintf(line, sizeof(line), "1d %.1f" "\xc2\xb0" "C", fabsf(view->history_delta_c[0]));
+        text_with_font(14, 45, line, s_share_tech_mono_fonts[0]);
+        if (view->history_valid[0]) draw_arrow(91, 51, view->history_delta_c[0] >= 0.0f);
+        if (view->history_valid[1]) snprintf(line, sizeof(line), "1w %.1f" "\xc2\xb0" "C", fabsf(view->history_delta_c[1])); else snprintf(line, sizeof(line), "1w n/d");
+        text_with_font(106, 45, line, s_share_tech_mono_fonts[0]);
+        if (view->history_valid[1]) draw_arrow(190, 51, view->history_delta_c[1] >= 0.0f);
+        if (view->history_valid[2]) snprintf(line, sizeof(line), "1m %.1f" "\xc2\xb0" "C", fabsf(view->history_delta_c[2])); else snprintf(line, sizeof(line), "1m n/d");
+        text_with_font(14, 64, line, s_share_tech_mono_fonts[0]);
+        if (view->history_valid[2]) draw_arrow(91, 70, view->history_delta_c[2] >= 0.0f);
+        if (view->history_valid[3]) snprintf(line, sizeof(line), "1y %.1f" "\xc2\xb0" "C", fabsf(view->history_delta_c[3])); else snprintf(line, sizeof(line), "1y n/d");
+        text_with_font(106, 64, line, s_share_tech_mono_fonts[0]);
+        if (view->history_valid[3]) draw_arrow(190, 70, view->history_delta_c[3] >= 0.0f);
+        text_centered(88, "batt", 1);
         history_chart(view->chart_values, view->chart_count);
     }
 }
