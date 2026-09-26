@@ -120,6 +120,14 @@ static esp_err_t activate_full_refresh(void)
     return wait_ready();
 }
 
+static esp_err_t activate_partial_refresh(void)
+{
+    ESP_RETURN_ON_ERROR(send_command(0x22), TAG, "partial update cmd");
+    ESP_RETURN_ON_ERROR(send_byte(0xff), TAG, "partial update mode");
+    ESP_RETURN_ON_ERROR(send_command(0x20), TAG, "partial display update");
+    return wait_ready();
+}
+
 static esp_err_t clear_panel_to_white(void)
 {
     memset(s_framebuffer, 0xff, sizeof(s_framebuffer));
@@ -487,12 +495,12 @@ static esp_err_t prepare_display(void)
     return clear_panel_to_white();
 }
 
-static esp_err_t present_framebuffer(void)
+static esp_err_t present_framebuffer(bool partial)
 {
     ESP_RETURN_ON_ERROR(set_window_and_cursor(), TAG, "set cursor");
     ESP_RETURN_ON_ERROR(send_command(0x24), TAG, "write RAM cmd");
     ESP_RETURN_ON_ERROR(send_data(s_framebuffer, sizeof(s_framebuffer)), TAG, "write RAM");
-    return activate_full_refresh();
+    return partial ? activate_partial_refresh() : activate_full_refresh();
 }
 
 esp_err_t epaper_show(const epaper_view_t *view)
@@ -502,14 +510,18 @@ esp_err_t epaper_show(const epaper_view_t *view)
     }
     ESP_RETURN_ON_ERROR(prepare_display(), TAG, "display init");
     render(view);
-    return present_framebuffer();
+    return present_framebuffer(false);
 }
 
 esp_err_t epaper_show_ota_progress(uint8_t percent, const char *status)
 {
+    static bool progress_started;
     if (percent > 100U) percent = 100U;
     if (!status) status = "UPDATING";
-    ESP_RETURN_ON_ERROR(prepare_display(), TAG, "display init");
+    if (!progress_started) {
+        ESP_RETURN_ON_ERROR(prepare_display(), TAG, "display init");
+        progress_started = true;
+    }
     memset(s_framebuffer, 0xff, sizeof(s_framebuffer));
     text_bold_centered(28, "FIRMWARE OTA", 2);
     text_centered(58, status, 1);
@@ -539,7 +551,9 @@ esp_err_t epaper_show_ota_progress(uint8_t percent, const char *status)
             pixel(x, y, true);
         }
     }
-    return present_framebuffer();
+    const esp_err_t result = present_framebuffer(percent > 0U && percent < 100U);
+    if (percent >= 100U) progress_started = false;
+    return result;
 }
 
 static void provisioning_qr(esp_qrcode_handle_t qrcode)
@@ -590,7 +604,7 @@ esp_err_t epaper_show_provisioning(const char *ap_ssid, const char *ap_password)
     snprintf(password_line, sizeof(password_line), "PASS %s", ap_password);
     text_centered(186, password_line, 1);
 
-    return present_framebuffer();
+    return present_framebuffer(false);
 }
 
 void epaper_shutdown(void)
