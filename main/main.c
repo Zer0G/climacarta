@@ -57,7 +57,11 @@ static void ota_task(void *arg)
 {
     TaskHandle_t waiter = (TaskHandle_t)arg;
     ESP_LOGI(TAG, "starting GitHub OTA update");
+    ESP_LOGI(TAG, "OTA task stack free before download: %u bytes",
+             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
     const esp_err_t ota_result = ota_install_from_github();
+    ESP_LOGI(TAG, "OTA task stack free after download: %u bytes",
+             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
     if (ota_result == ESP_ERR_NOT_FOUND) {
         ESP_LOGI(TAG, "GitHub OTA: no newer firmware available");
     } else if (ota_result != ESP_OK) {
@@ -418,7 +422,7 @@ void app_main(void)
         if (network_take_ota_request()) {
             TaskHandle_t ota_handle = NULL;
             TaskHandle_t waiter = xTaskGetCurrentTaskHandle();
-            if (xTaskCreate(ota_task, "ota_task", 12288, waiter, 5,
+            if (xTaskCreate(ota_task, "ota_task", 24576, waiter, 5,
                             &ota_handle) != pdPASS) {
                 ESP_LOGE(TAG, "cannot start OTA task");
             } else {
