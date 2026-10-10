@@ -51,4 +51,5 @@ bool stats_delta_reference(const stats_runtime_t *runtime, uint8_t page,
 uint8_t stats_chart_series(const stats_runtime_t *runtime, uint8_t page,
                            time_t now, float *values, uint8_t capacity);
 uint8_t stats_battery_chart(const stats_runtime_t *runtime, time_t now,
-                            float *values, uint8_t capacity);
+                            float *values, uint8_t capacity,
+                            uint8_t *span_days);

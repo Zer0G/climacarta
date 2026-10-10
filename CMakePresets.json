@@ -1,0 +1,27 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "c6",
+      "displayName": "Waveshare ESP32-C6-ePaper-1.54",
+      "generator": "Ninja",
+      "binaryDir": "build-c6",
+      "cacheVariables": {
+        "IDF_TARGET": "esp32c6",
+        "SDKCONFIG": "sdkconfig.c6",
+        "SDKCONFIG_DEFAULTS": "sdkconfig.defaults"
+      }
+    },
+    {
+      "name": "s3",
+      "displayName": "Waveshare ESP32-S3-ePaper-1.54G",
+      "generator": "Ninja",
+      "binaryDir": "build-s3",
+      "cacheVariables": {
+        "IDF_TARGET": "esp32s3",
+        "SDKCONFIG": "sdkconfig.s3",
+        "SDKCONFIG_DEFAULTS": "sdkconfig.defaults"
+      }
+    }
+  ]
+}

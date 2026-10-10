@@ -44,7 +44,6 @@ esp_err_t settings_init(void)
 
 uint32_t settings_get_t_sample(void) { return s_t_sample; }
 uint32_t settings_get_update_freq(void) { return s_update_freq; }
-
 esp_err_t settings_set_t_sample(uint32_t value)
 {
     if (value < T_SAMPLE_MIN || value > T_SAMPLE_MAX) return ESP_ERR_INVALID_ARG;

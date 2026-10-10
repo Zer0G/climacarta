@@ -26,10 +26,11 @@ config RHT_MQTT_BASE_TOPIC
 
 config RHT_OTA_MANIFEST_URL
     string "GitHub OTA manifest URL"
-        default "https://github.com/zer0g/climacarta/releases/latest/download/manifest.json"
+    default "https://github.com/zer0g/climacarta/releases/latest/download/manifest-esp32s3-epaper-1.54g.json" if IDF_TARGET_ESP32S3
+    default "https://github.com/zer0g/climacarta/releases/latest/download/manifest-esp32c6-epaper-1.54.json"
     help
-        Public HTTPS URL of the GitHub Releases manifest. The manifest must
-        contain version, url, and sha256 string fields.
+        Public HTTPS URL of the target-specific GitHub Releases manifest. The
+        manifest must contain board, version, url, and sha256 string fields.
 
 config RHT_DEVICE_ID
     string "Home Assistant device id"
@@ -46,11 +47,12 @@ config RHT_TIMEZONE
 config RHT_T_SAMPLE
     int "t_sample: sampling interval in seconds"
     range 10 86400
-    default 900
+    default 3600
     help
         Interval between sensor readings and statistics updates. While an
         active USB host is connected, the device stays awake and keeps the
-        command console available.
+        command console available. Periodic slots are aligned to local
+        midnight (for example, 900 seconds gives 00:00, 00:15, 00:30, ...).
 
 config RHT_UPDATE_FREQ
     int "update_freq: MQTT update multiplier"
@@ -58,7 +60,8 @@ config RHT_UPDATE_FREQ
     default 1
     help
         Number of t_sample intervals between Wi-Fi/MQTT updates. Values 0 and
-        1 publish every sample, 2 every two samples, and so on.
+        1 publish every sample, 2 every two samples, and so on. The phase is
+        anchored at local midnight and is not shifted by a manual wake-up.
 
 config RHT_TEMP_OFFSET_C_X100
     int "SHTC3 temperature calibration offset, hundredths C"

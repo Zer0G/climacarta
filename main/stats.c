@@ -269,6 +269,7 @@ static esp_err_t storage_scan(stats_runtime_t *runtime, time_t now, bool reconst
     const uint32_t capacity = s_partition->size / sizeof(stats_record_t);
     uint32_t newest_sequence = 0;
     uint32_t newest_slot = capacity - 1U;
+    uint32_t valid_records = 0;
     bool found = false;
 
     for (uint32_t slot = 0; slot < capacity; ++slot) {
@@ -278,6 +279,7 @@ static esp_err_t storage_scan(stats_runtime_t *runtime, time_t now, bool reconst
         if (!record_valid(&record)) {
             continue;
         }
+        ++valid_records;
         if (!found || record.sequence > newest_sequence) {
             found = true;
             newest_sequence = record.sequence;
@@ -303,7 +305,8 @@ static esp_err_t storage_scan(stats_runtime_t *runtime, time_t now, bool reconst
     runtime->flash_head = found ? (newest_slot + 1U) % capacity : 0;
     runtime->next_sequence = found ? newest_sequence + 1U : 1U;
     runtime->flash_index_valid = true;
-    ESP_LOGI(TAG, "log records=%lu next_slot=%lu", (unsigned long)capacity,
+    ESP_LOGI(TAG, "log records=%lu/%lu next_slot=%lu",
+             (unsigned long)valid_records, (unsigned long)capacity,
              (unsigned long)runtime->flash_head);
     (void)now;
     return ESP_OK;
@@ -605,37 +608,109 @@ uint8_t stats_chart_series(const stats_runtime_t *runtime, uint8_t page,
 }
 
 uint8_t stats_battery_chart(const stats_runtime_t *runtime, time_t now,
-                            float *values, uint8_t capacity)
+                            float *values, uint8_t capacity,
+                            uint8_t *chart_span_days)
 {
+    if (chart_span_days) *chart_span_days = 0;
     if (!runtime || !values || !capacity || !s_partition) return 0;
+    enum {
+        SECONDS_PER_HOUR = 3600,
+        SECONDS_PER_DAY = 24 * SECONDS_PER_HOUR,
+        MAX_BATTERY_HISTORY_DAYS = 60,
+        MAX_BATTERY_CHART_BUCKETS = 31,
+    };
+    if (capacity > MAX_BATTERY_CHART_BUCKETS) {
+        capacity = MAX_BATTERY_CHART_BUCKETS;
+    }
     const uint32_t flash_capacity = s_partition->size / sizeof(stats_record_t);
     const uint32_t record_count = stored_record_count(runtime, flash_capacity);
-    struct tm start_tm;
-    localtime_r(&now, &start_tm);
-    start_tm.tm_hour = 0;
-    start_tm.tm_min = 0;
-    start_tm.tm_sec = 0;
-    start_tm.tm_mday -= 30;
-    start_tm.tm_isdst = -1;
-    const time_t range_start = mktime(&start_tm);
-    const time_t range_end = period_start(now, STATS_DAY);
-    uint8_t count = 0;
-    for (uint32_t age = 0; age < record_count && count < capacity; ++age) {
+    const time_t oldest_allowed = now -
+        (time_t)MAX_BATTERY_HISTORY_DAYS * SECONDS_PER_DAY;
+    time_t earliest = 0;
+
+    for (uint32_t age = 0; age < record_count; ++age) {
         const uint32_t slot = (runtime->flash_head + flash_capacity - 1U - age) % flash_capacity;
         stats_record_t record;
         if (esp_partition_read(s_partition, (size_t)slot * sizeof(record),
                                &record, sizeof(record)) != ESP_OK) break;
-        if (!record_valid(&record) || record.kind != STATS_DAY ||
+        if (!record_valid(&record) || record.kind != STATS_HOUR ||
             record.battery_avg_mv == 0) continue;
         const time_t record_start = (time_t)record.period_start;
-        if (record_start >= range_start && record_start < range_end) {
-            values[count++] = (float)record.battery_avg_mv;
+        if (record_start >= oldest_allowed && record_start <= now &&
+            (!earliest || record_start < earliest)) {
+            earliest = record_start;
         }
     }
-    for (uint8_t left = 0, right = count ? count - 1U : 0; left < right; ++left, --right) {
-        const float temporary = values[left];
-        values[left] = values[right];
-        values[right] = temporary;
+    if (runtime->hour.sample_count && runtime->hour.battery_mv_sum > 0.0 &&
+        (!earliest || runtime->hour.period_start < earliest)) {
+        earliest = runtime->hour.period_start;
     }
-    return count;
+    if (!earliest) return 0;
+
+    uint32_t span_days = (uint32_t)((now - earliest + SECONDS_PER_DAY - 1) /
+                                    SECONDS_PER_DAY);
+    if (span_days < 1U) span_days = 1U;
+    if (span_days > MAX_BATTERY_HISTORY_DAYS) {
+        span_days = MAX_BATTERY_HISTORY_DAYS;
+    }
+    uint32_t bucket_seconds;
+    uint8_t bucket_count;
+    time_t range_end;
+    if (span_days == 1U) {
+        bucket_seconds = SECONDS_PER_HOUR;
+        bucket_count = capacity < 24U ? capacity : 24U;
+        range_end = period_start(now, STATS_HOUR) + SECONDS_PER_HOUR;
+    } else {
+        const uint32_t bucket_days = span_days <= capacity ? 1U : 2U;
+        bucket_seconds = bucket_days * SECONDS_PER_DAY;
+        bucket_count = (uint8_t)((span_days + bucket_days - 1U) / bucket_days);
+        if (bucket_count > capacity) bucket_count = capacity;
+        range_end = period_start(now, STATS_DAY) + SECONDS_PER_DAY;
+    }
+    if (chart_span_days) {
+        *chart_span_days = (uint8_t)(((uint32_t)bucket_count *
+                                      bucket_seconds + SECONDS_PER_DAY - 1U) /
+                                     SECONDS_PER_DAY);
+    }
+    const time_t range_start = range_end -
+        (time_t)bucket_count * bucket_seconds;
+
+    double sums[MAX_BATTERY_CHART_BUCKETS] = {0};
+    uint32_t samples[MAX_BATTERY_CHART_BUCKETS] = {0};
+    for (uint8_t i = 0; i < bucket_count; ++i) values[i] = NAN;
+
+    for (uint32_t age = 0; age < record_count; ++age) {
+        const uint32_t slot = (runtime->flash_head + flash_capacity - 1U - age) % flash_capacity;
+        stats_record_t record;
+        if (esp_partition_read(s_partition, (size_t)slot * sizeof(record),
+                               &record, sizeof(record)) != ESP_OK) break;
+        if (!record_valid(&record) || record.kind != STATS_HOUR ||
+            record.battery_avg_mv == 0) continue;
+        const time_t record_start = (time_t)record.period_start;
+        if (record_start < range_start || record_start >= range_end) continue;
+        const uint8_t index = (uint8_t)((record_start - range_start) /
+                                        bucket_seconds);
+        if (index >= bucket_count) continue;
+        sums[index] += (double)record.battery_avg_mv * record.sample_count;
+        samples[index] += record.sample_count;
+    }
+
+    if (runtime->hour.sample_count && runtime->hour.battery_mv_sum > 0.0 &&
+        runtime->hour.period_start >= range_start &&
+        runtime->hour.period_start < range_end) {
+        const uint8_t index = (uint8_t)((runtime->hour.period_start - range_start) /
+                                        bucket_seconds);
+        if (index < bucket_count) {
+            sums[index] += runtime->hour.battery_mv_sum;
+            samples[index] += runtime->hour.sample_count;
+        }
+    }
+
+    for (uint8_t i = 0; i < bucket_count; ++i) {
+        if (samples[i]) values[i] = (float)(sums[i] / samples[i]);
+    }
+    ESP_LOGI(TAG, "battery chart span=%lu days buckets=%u resolution=%lu h",
+             (unsigned long)span_days, (unsigned)bucket_count,
+             (unsigned long)(bucket_seconds / SECONDS_PER_HOUR));
+    return bucket_count;
 }

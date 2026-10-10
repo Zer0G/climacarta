@@ -46,11 +46,15 @@ static volatile bool s_ota_requested;
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
-    (void)data;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (++s_wifi_retries < 4) {
+        const wifi_event_sta_disconnected_t *event = data;
+        const int attempt = ++s_wifi_retries;
+        ESP_LOGW(TAG, "Wi-Fi disconnected: reason=%u rssi=%d attempt=%d/4",
+                 event ? (unsigned)event->reason : 0U,
+                 event ? (int)event->rssi : 0, attempt);
+        if (attempt < 4) {
             esp_wifi_connect();
         } else {
             xEventGroupSetBits(s_wifi_events, WIFI_FAILED_BIT);
@@ -246,6 +250,14 @@ esp_err_t network_connect(int8_t *rssi)
     memcpy(config.sta.password, password, strlen(password));
     config.sta.threshold.authmode = password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+#if !CONFIG_ESP_WIFI_GCMP_SUPPORT
+    /*
+     * Mixed WPA2/WPA3 access points can advertise a WPA3 RSN override using
+     * GCMP. When GCMP is not built into the driver, use the access point's
+     * WPA2-CCMP path instead of starting a handshake that cannot complete.
+     */
+    config.sta.disable_wpa3_compatible_mode = 1;
+#endif
     if ((result = esp_wifi_set_mode(WIFI_MODE_STA)) != ESP_OK) goto fail;
     if ((result = esp_wifi_set_config(WIFI_IF_STA, &config)) != ESP_OK) goto fail;
     if ((result = esp_wifi_set_ps(WIFI_PS_MAX_MODEM)) != ESP_OK) goto fail;
@@ -580,12 +592,12 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
         const int base_length = snprintf(payload, sizeof(payload),
                  "{\"timestamp\":%" PRIi64 ",\"firmware_version\":\"%s\",\"temperature\":%.2f,\"humidity\":%.2f,"
                  "\"dew_point\":%.2f,\"day_min\":%.2f,\"day_max\":%.2f,"
-                 "\"battery\":%u,\"battery_voltage\":%.0f,\"rssi\":%d",
+                 "\"battery\":%u,\"battery_voltage\":%lu,\"rssi\":%d",
                  (int64_t)measurement->timestamp, esp_app_get_description()->version,
                  measurement->temperature_c,
                  measurement->humidity_pct, measurement->dew_point_c,
                  measurement->day_min_c, measurement->day_max_c,
-                 measurement->battery_pct, measurement->battery_v * 1000.0f,
+                 measurement->battery_pct, (unsigned long)measurement->battery_mv,
                  measurement->rssi);
         size_t used = base_length > 0 ? (size_t)base_length : sizeof(payload);
         if (used >= sizeof(payload)) {

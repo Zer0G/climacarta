@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "board_config.h"
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_https_ota.h"
@@ -18,6 +19,7 @@
 #define OTA_MANIFEST_MAX_SIZE 2048
 #define OTA_URL_MAX_SIZE      512
 #define OTA_SHA256_HEX_SIZE   65
+#define OTA_BOARD_ID_MAX_SIZE 64
 #define OTA_HTTP_BUFFER_SIZE  4096
 
 static const char *TAG = "ota";
@@ -66,10 +68,20 @@ static int hex_value(char value)
 static bool parse_manifest(const char *json, char *version, char *url,
                            char *sha256)
 {
-    return json_string(json, "version", version, OTA_VERSION_MAX_SIZE) &&
-           json_string(json, "url", url, OTA_URL_MAX_SIZE) &&
-           json_string(json, "sha256", sha256, OTA_SHA256_HEX_SIZE) &&
-           valid_sha256(sha256) && strncmp(url, "https://", 8) == 0;
+    char board[OTA_BOARD_ID_MAX_SIZE];
+    if (!json_string(json, "board", board, sizeof(board)) ||
+        !json_string(json, "version", version, OTA_VERSION_MAX_SIZE) ||
+        !json_string(json, "url", url, OTA_URL_MAX_SIZE) ||
+        !json_string(json, "sha256", sha256, OTA_SHA256_HEX_SIZE) ||
+        !valid_sha256(sha256) || strncmp(url, "https://", 8) != 0) {
+        return false;
+    }
+    if (strcmp(board, BOARD_OTA_ID) != 0) {
+        ESP_LOGE(TAG, "OTA manifest is for '%s', running board is '%s'",
+                 board, BOARD_OTA_ID);
+        return false;
+    }
+    return true;
 }
 
 static esp_err_t fetch_manifest(char *manifest, size_t manifest_size)

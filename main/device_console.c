@@ -4,12 +4,17 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "board_config.h"
+#include "board.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "epaper.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "network.h"
@@ -19,6 +24,14 @@
 #define CONSOLE_MAX_ARGS  8
 
 static const char *TAG = "console";
+static volatile bool s_provision_requested;
+
+bool device_console_take_provision_request(void)
+{
+    if (!s_provision_requested) return false;
+    s_provision_requested = false;
+    return true;
+}
 
 static void console_write(const char *format, ...)
 {
@@ -39,6 +52,11 @@ static void print_help(void)
         "\r\nAvailable commands:\r\n"
         "  help\r\n"
         "  show\r\n"
+        "  provision\r\n"
+        "  display test\r\n"
+        "  i2c check\r\n"
+        "  rtc show\r\n"
+        "  rtc set <yyyy-mm-dd> <hh:mm:ss>\r\n"
         "  wifi set <ssid> [password]\r\n"
         "  wifi clear\r\n"
         "  mqtt set <mqtt://host:port> [username] [password]\r\n"
@@ -49,6 +67,102 @@ static void print_help(void)
         "  reboot\r\n"
         "Use quotes for values containing spaces and \\ for escaping.\r\n"
         "Input is not echoed, so passwords remain hidden.\r\n");
+}
+
+static bool parse_local_datetime(const char *date, const char *clock,
+                                 time_t *utc)
+{
+    int year, month, day, hour, minute, second;
+    char trailing;
+    if (sscanf(date, "%d-%d-%d%c", &year, &month, &day, &trailing) != 3 ||
+        sscanf(clock, "%d:%d:%d%c", &hour, &minute, &second, &trailing) != 3 ||
+        year < 2024 || year > 2099 || month < 1 || month > 12 ||
+        day < 1 || day > 31 || hour < 0 || hour > 23 ||
+        minute < 0 || minute > 59 || second < 0 || second > 59) {
+        return false;
+    }
+    struct tm local = {
+        .tm_year = year - 1900,
+        .tm_mon = month - 1,
+        .tm_mday = day,
+        .tm_hour = hour,
+        .tm_min = minute,
+        .tm_sec = second,
+        .tm_isdst = -1,
+    };
+    const time_t parsed = mktime(&local);
+    if (parsed == (time_t)-1) {
+        return false;
+    }
+    struct tm verified;
+    localtime_r(&parsed, &verified);
+    if (verified.tm_year != year - 1900 ||
+        verified.tm_mon != month - 1 || verified.tm_mday != day ||
+        verified.tm_hour != hour || verified.tm_min != minute ||
+        verified.tm_sec != second) {
+        return false;
+    }
+    *utc = parsed;
+    return true;
+}
+
+static void print_datetime(const char *prefix, time_t utc)
+{
+    struct tm local;
+    char formatted[48];
+    localtime_r(&utc, &local);
+    if (strftime(formatted, sizeof(formatted), "%Y-%m-%d %H:%M:%S %Z", &local)) {
+        console_write("%s%s\r\n", prefix, formatted);
+    }
+}
+
+static void show_rtc(void)
+{
+    time_t utc;
+    if (board_rtc_get(&utc)) {
+        print_datetime("RTC: ", utc);
+        return;
+    }
+    time(&utc);
+    struct tm local;
+    localtime_r(&utc, &local);
+    console_write("ERROR: RTC read failed.\r\n");
+    if (local.tm_year + 1900 >= 2024) {
+        print_datetime("System clock: ", utc);
+    }
+}
+
+static void set_rtc(const char *date, const char *clock)
+{
+    time_t utc;
+    if (!parse_local_datetime(date, clock, &utc)) {
+        console_write("ERROR: invalid date/time; use rtc set yyyy-mm-dd hh:mm:ss.\r\n");
+        return;
+    }
+
+    const struct timeval system_time = {.tv_sec = utc, .tv_usec = 0};
+    if (settimeofday(&system_time, NULL) != 0) {
+        console_write("ERROR: could not set the system clock.\r\n");
+        return;
+    }
+    const esp_err_t result = board_rtc_set(utc);
+    if (result != ESP_OK) {
+        console_write("WARNING: system clock set, but RTC write failed: %s.\r\n",
+                      esp_err_to_name(result));
+        return;
+    }
+    time_t readback;
+    if (!board_rtc_get(&readback)) {
+        console_write("WARNING: RTC write completed, but readback failed.\r\n");
+        return;
+    }
+    const double difference = difftime(readback, utc);
+    if (difference < -1.0 || difference > 1.0) {
+        console_write("WARNING: RTC readback differs from requested time.\r\n");
+        print_datetime("RTC: ", readback);
+        return;
+    }
+    print_datetime("OK - RTC and system clock set to ", readback);
 }
 
 static int split_arguments(char *line, char **arguments, int capacity)
@@ -101,7 +215,9 @@ static void print_configuration(void)
                   mqtt ? "configured" : "not configured", mqtt ? uri : "-",
                   mqtt && username[0] ? username : "(empty)",
                   mqtt && mqtt_password[0] ? "********" : "(empty)");
-    console_write("Settings: t_sample=%lu s, update_freq=%lu samples\r\n",
+    console_write("Board: %s\r\nDisplay: %s\r\n"
+                  "Settings: t_sample=%lu s, update_freq=%lu samples\r\n",
+                  BOARD_MODEL_NAME, BOARD_DISPLAY_NAME,
                   (unsigned long)settings_get_t_sample(),
                   (unsigned long)settings_get_update_freq());
 }
@@ -128,6 +244,29 @@ static void execute_line(char *line)
         print_help();
     } else if (!strcmp(arguments[0], "show") && count == 1) {
         print_configuration();
+    } else if (!strcmp(arguments[0], "provision") && count == 1) {
+        s_provision_requested = true;
+        console_write("Provisioning requested; the QR code will appear after the current display cycle.\r\n");
+    } else if (!strcmp(arguments[0], "rtc") && count == 2 &&
+               !strcmp(arguments[1], "show")) {
+        show_rtc();
+    } else if (!strcmp(arguments[0], "rtc") && count == 4 &&
+               !strcmp(arguments[1], "set")) {
+        set_rtc(arguments[2], arguments[3]);
+    } else if (!strcmp(arguments[0], "display") && count == 2 &&
+               !strcmp(arguments[1], "test")) {
+        console_write("Starting display color test; this can take up to a minute.\r\n");
+        const esp_err_t result = epaper_show_test_pattern();
+        if (result == ESP_OK) {
+            console_write("OK - 4 native colors and 6 dithered blends sent.\r\n");
+        } else {
+            console_write("ERROR: %s; inspect the epaper log lines above.\r\n",
+                          esp_err_to_name(result));
+        }
+    } else if (!strcmp(arguments[0], "i2c") && count == 2 &&
+               !strcmp(arguments[1], "check")) {
+        board_log_i2c_devices();
+        console_write("I2C diagnostic written to the monitor log.\r\n");
     } else if (!strcmp(arguments[0], "wifi") && count == 2 &&
                !strcmp(arguments[1], "clear")) {
         report_result(network_clear_wifi_credentials());

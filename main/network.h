@@ -20,7 +20,7 @@ typedef struct {
     float dew_point_c;
     float day_min_c;
     float day_max_c;
-    float battery_v;
+    uint32_t battery_mv;
     uint8_t battery_pct;
     int8_t rssi;
     char installed_version[NETWORK_VERSION_SIZE];

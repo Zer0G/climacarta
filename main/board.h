@@ -4,10 +4,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "board_config.h"
 #include "esp_err.h"
-
-#define BOARD_BUTTON_BOOT_GPIO  9
-#define BOARD_BUTTON_POWER_GPIO 2
 
 typedef struct {
     float temperature_c;
@@ -23,5 +21,7 @@ esp_err_t board_rtc_set(time_t utc);
 
 esp_err_t board_epaper_power(bool enabled);
 esp_err_t board_battery_measure_power(bool enabled);
+esp_err_t board_activity_led(bool enabled);
+void board_log_i2c_devices(void);
 void board_prepare_for_sleep(void);
 

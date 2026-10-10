@@ -25,12 +25,18 @@ typedef struct {
     bool history_valid[4];
     uint8_t page;
     uint8_t chart_count;
+    uint8_t chart_span_days;
     bool delta_valid;
+    bool environment_valid;
     bool time_valid;
     bool wifi_connected;
+    bool mqtt_connected;
 } epaper_view_t;
 
 esp_err_t epaper_show(const epaper_view_t *view);
+/* Draw the controller's four native colors. Intended for hardware diagnosis. */
+esp_err_t epaper_show_test_pattern(void);
 esp_err_t epaper_show_ota_progress(uint8_t percent, const char *status);
+esp_err_t epaper_show_ota_result(const char *status);
 esp_err_t epaper_show_provisioning(const char *ap_ssid, const char *ap_password);
 void epaper_shutdown(void);

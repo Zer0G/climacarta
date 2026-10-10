@@ -16,8 +16,6 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
-#define I2C_SDA_GPIO       18
-#define I2C_SCL_GPIO       8
 #define I2C_PORT           I2C_NUM_0
 #define I2C_SPEED_HZ       100000
 #define I2C_TIMEOUT_MS     1000
@@ -30,7 +28,6 @@
 #define TCA_EPD_POWER_BIT  (1U << 0)
 #define TCA_GREEN_LED_BIT  (1U << 4)
 #define TCA_BAT_ENABLE_BIT (1U << 5)
-#define BATTERY_ADC_CHAN   ADC_CHANNEL_0
 #define BATTERY_ADC_SAMPLES 32
 #define BATTERY_ADC_TRIM    4
 #define BATTERY_DIVIDER_RATIO 2U
@@ -39,11 +36,14 @@ static const char *TAG = "board";
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_shtc3;
 static i2c_master_dev_handle_t s_rtc;
+#if BOARD_USES_IO_EXPANDER
 static i2c_master_dev_handle_t s_expander;
 static uint8_t s_expander_output;
+#endif
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_adc_cali;
 static bool s_adc_calibrated;
+static bool s_i2c_diagnostic_reported;
 
 static esp_err_t add_i2c_device(uint8_t address, i2c_master_dev_handle_t *handle)
 {
@@ -61,10 +61,34 @@ static esp_err_t write_register(i2c_master_dev_handle_t dev, uint8_t reg, uint8_
     return i2c_master_transmit(dev, data, sizeof(data), I2C_TIMEOUT_MS);
 }
 
+void board_log_i2c_devices(void)
+{
+    if (!s_bus) return;
+    static const struct {
+        uint8_t address;
+        const char *name;
+    } devices[] = {
+        {0x18, "ES8311 audio codec"},
+        {PCF85063_ADDRESS, "PCF85063 RTC"},
+        {SHTC3_ADDRESS, "SHTC3"},
+    };
+    ESP_LOGW(TAG, "I2C diagnostic: SDA GPIO%d=%d, SCL GPIO%d=%d",
+             BOARD_I2C_SDA_GPIO, gpio_get_level(BOARD_I2C_SDA_GPIO),
+             BOARD_I2C_SCL_GPIO, gpio_get_level(BOARD_I2C_SCL_GPIO));
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); ++i) {
+        const esp_err_t result = i2c_master_probe(s_bus, devices[i].address,
+                                                   I2C_TIMEOUT_MS);
+        ESP_LOGW(TAG, "I2C %s at 0x%02x: %s", devices[i].name,
+                 devices[i].address, esp_err_to_name(result));
+    }
+}
+
+#if BOARD_USES_IO_EXPANDER
 static void log_i2c_scan(void)
 {
     bool found = false;
-    ESP_LOGW(TAG, "I2C scan on SDA GPIO%d / SCL GPIO%d", I2C_SDA_GPIO, I2C_SCL_GPIO);
+    ESP_LOGW(TAG, "I2C scan on SDA GPIO%d / SCL GPIO%d",
+             BOARD_I2C_SDA_GPIO, BOARD_I2C_SCL_GPIO);
     for (uint8_t address = 0x08; address <= 0x77; ++address) {
         if (i2c_master_probe(s_bus, address, 50) == ESP_OK) {
             ESP_LOGW(TAG, "I2C device found at 0x%02x", address);
@@ -98,6 +122,7 @@ static esp_err_t expander_commit(void)
 {
     return write_register(s_expander, TCA_OUTPUT_REG, s_expander_output);
 }
+#endif
 
 static uint8_t shtc3_crc(const uint8_t *data, size_t length)
 {
@@ -185,6 +210,32 @@ static void sort_millivolts(int *samples, size_t count)
 
 esp_err_t board_init(void)
 {
+#if !BOARD_USES_IO_EXPANDER
+    /* BAT_Control must remain high after the PWR key is released. Configure
+     * its output value before releasing a hold left by deep sleep. */
+    const gpio_config_t power_outputs = {
+        .pin_bit_mask = (1ULL << BOARD_BATTERY_HOLD_GPIO) |
+                        (1ULL << BOARD_EPD_POWER_GPIO) |
+                        (1ULL << BOARD_AUDIO_POWER_GPIO) |
+                        (1ULL << BOARD_GREEN_LED_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&power_outputs), TAG, "power outputs");
+    gpio_set_level(BOARD_BATTERY_HOLD_GPIO, 1);
+    gpio_set_level(BOARD_EPD_POWER_GPIO, 1); /* Active-low: display off. */
+    gpio_set_level(BOARD_GREEN_LED_GPIO, BOARD_GREEN_LED_ON_LEVEL);
+    /* The official board startup powers PAVCC before initializing I2C. The
+     * ES8311 shares SDA/SCL with the RTC and SHTC3; leaving its rail off can
+     * partially power the codec through those lines and clamp SDA low. */
+    gpio_set_level(BOARD_AUDIO_POWER_GPIO, BOARD_AUDIO_POWER_ON_LEVEL);
+    gpio_hold_dis(BOARD_BATTERY_HOLD_GPIO);
+    gpio_deep_sleep_hold_dis();
+    vTaskDelay(pdMS_TO_TICKS(10));
+#endif
+
     const gpio_config_t buttons = {
         .pin_bit_mask = (1ULL << BOARD_BUTTON_BOOT_GPIO) | (1ULL << BOARD_BUTTON_POWER_GPIO),
         .mode = GPIO_MODE_INPUT,
@@ -196,8 +247,8 @@ esp_err_t board_init(void)
 
     const i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_PORT,
-        .sda_io_num = I2C_SDA_GPIO,
-        .scl_io_num = I2C_SCL_GPIO,
+        .sda_io_num = BOARD_I2C_SDA_GPIO,
+        .scl_io_num = BOARD_I2C_SCL_GPIO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
@@ -205,10 +256,13 @@ esp_err_t board_init(void)
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &s_bus), TAG, "I2C bus");
     vTaskDelay(pdMS_TO_TICKS(100));
 
+#if BOARD_USES_IO_EXPANDER
     ESP_RETURN_ON_ERROR(probe_i2c_device(TCA9554_ADDRESS, "TCA9554"), TAG,
                         "TCA9554 not found");
+#endif
     ESP_RETURN_ON_ERROR(add_i2c_device(SHTC3_ADDRESS, &s_shtc3), TAG, "SHTC3");
     ESP_RETURN_ON_ERROR(add_i2c_device(PCF85063_ADDRESS, &s_rtc), TAG, "RTC");
+#if BOARD_USES_IO_EXPANDER
     ESP_RETURN_ON_ERROR(add_i2c_device(TCA9554_ADDRESS, &s_expander), TAG, "TCA9554");
 
     /* P2 (RTC interrupt) and P6 (touch interrupt) are inputs; all other pins outputs.
@@ -218,6 +272,7 @@ esp_err_t board_init(void)
     s_expander_output = TCA_BAT_ENABLE_BIT;
     ESP_RETURN_ON_ERROR(expander_commit(), TAG, "TCA output");
     ESP_RETURN_ON_ERROR(write_register(s_expander, TCA_CONFIG_REG, 0x44), TAG, "TCA direction");
+#endif
 
     const adc_oneshot_unit_init_cfg_t adc_unit = {.unit_id = ADC_UNIT_1};
     ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&adc_unit, &s_adc), TAG, "ADC unit");
@@ -225,11 +280,12 @@ esp_err_t board_init(void)
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
-    ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, BATTERY_ADC_CHAN, &adc_channel), TAG, "ADC channel");
+    ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, BOARD_BATTERY_ADC_CHAN,
+                                                   &adc_channel), TAG, "ADC channel");
 
     const adc_cali_curve_fitting_config_t cali = {
         .unit_id = ADC_UNIT_1,
-        .chan = BATTERY_ADC_CHAN,
+        .chan = BOARD_BATTERY_ADC_CHAN,
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
@@ -245,22 +301,46 @@ esp_err_t board_init(void)
 
 esp_err_t board_epaper_power(bool enabled)
 {
+#if BOARD_USES_IO_EXPANDER
     if (enabled) {
         s_expander_output |= TCA_EPD_POWER_BIT;
     } else {
         s_expander_output &= (uint8_t)~TCA_EPD_POWER_BIT;
     }
     return expander_commit();
+#else
+    return gpio_set_level(BOARD_EPD_POWER_GPIO, enabled ? 0 : 1);
+#endif
 }
 
 esp_err_t board_battery_measure_power(bool enabled)
 {
+#if BOARD_USES_IO_EXPANDER
     if (enabled) {
         s_expander_output |= TCA_BAT_ENABLE_BIT;
     } else {
         s_expander_output &= (uint8_t)~TCA_BAT_ENABLE_BIT;
     }
     return expander_commit();
+#else
+    return gpio_set_level(BOARD_BATTERY_HOLD_GPIO, enabled ? 1 : 0);
+#endif
+}
+
+esp_err_t board_activity_led(bool enabled)
+{
+#if BOARD_USES_IO_EXPANDER
+    if (enabled) {
+        s_expander_output &= (uint8_t)~TCA_GREEN_LED_BIT;
+    } else {
+        s_expander_output |= TCA_GREEN_LED_BIT;
+    }
+    return expander_commit();
+#else
+    return gpio_set_level(BOARD_GREEN_LED_GPIO,
+                          enabled ? BOARD_GREEN_LED_ON_LEVEL :
+                                    !BOARD_GREEN_LED_ON_LEVEL);
+#endif
 }
 
 esp_err_t board_read_environment(board_sample_t *sample)
@@ -273,7 +353,13 @@ esp_err_t board_read_environment(board_sample_t *sample)
     const uint8_t sleep[] = {0xb0, 0x98};
     uint8_t data[6];
 
-    ESP_RETURN_ON_ERROR(i2c_master_transmit(s_shtc3, wake, sizeof(wake), I2C_TIMEOUT_MS), TAG, "SHTC3 wake");
+    const esp_err_t wake_result = i2c_master_transmit(s_shtc3, wake, sizeof(wake),
+                                                       I2C_TIMEOUT_MS);
+    if (wake_result != ESP_OK && !s_i2c_diagnostic_reported) {
+        s_i2c_diagnostic_reported = true;
+        board_log_i2c_devices();
+    }
+    ESP_RETURN_ON_ERROR(wake_result, TAG, "SHTC3 wake");
     /* SHTC3 needs at least 240 us after wake. With a 100 Hz FreeRTOS tick,
      * pdMS_TO_TICKS(1) is zero and previously sent the next command immediately. */
     esp_rom_delay_us(500);
@@ -304,7 +390,8 @@ esp_err_t board_read_battery(float *voltage, uint8_t *percent)
     int samples[BATTERY_ADC_SAMPLES];
     for (size_t i = 0; i < BATTERY_ADC_SAMPLES; ++i) {
         int raw = 0;
-        ESP_RETURN_ON_ERROR(adc_oneshot_read(s_adc, BATTERY_ADC_CHAN, &raw), TAG, "ADC read");
+        ESP_RETURN_ON_ERROR(adc_oneshot_read(s_adc, BOARD_BATTERY_ADC_CHAN, &raw),
+                            TAG, "ADC read");
         int millivolts = 0;
         if (s_adc_calibrated) {
             ESP_RETURN_ON_ERROR(adc_cali_raw_to_voltage(s_adc_cali, raw, &millivolts), TAG, "ADC convert");
@@ -383,7 +470,15 @@ esp_err_t board_rtc_set(time_t utc)
 void board_prepare_for_sleep(void)
 {
     (void)board_epaper_power(false);
-    /* Active-low: turn the activity LED off before deep sleep. */
-    s_expander_output |= TCA_GREEN_LED_BIT;
-    (void)expander_commit();
+    (void)board_activity_led(false);
+#if BOARD_USES_IO_EXPANDER
+#else
+    /* Audio power is active-low. Disable the codec rail while sleeping; it is
+     * enabled again before I2C initialization on the next boot. */
+    gpio_set_level(BOARD_AUDIO_POWER_GPIO, !BOARD_AUDIO_POWER_ON_LEVEL);
+    /* Keep the battery power latch asserted while the ESP32-S3 sleeps. */
+    gpio_set_level(BOARD_BATTERY_HOLD_GPIO, 1);
+    gpio_hold_en(BOARD_BATTERY_HOLD_GPIO);
+    gpio_deep_sleep_hold_en();
+#endif
 }

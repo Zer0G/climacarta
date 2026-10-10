@@ -1,6 +1,7 @@
 #include "provisioning.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,26 +21,25 @@
 #include "lwip/sockets.h"
 #include "network.h"
 
-#define PROVISION_CONNECTED_BIT BIT0
-#define PROVISION_FAILED_BIT    BIT1
-#define PROVISION_DONE_BIT      BIT2
-#define PROVISION_TIMEOUT_MS    (5 * 60 * 1000)
-#define PROVISION_CONNECT_MS    20000
+#define PROVISION_DONE_BIT   BIT0
+#define DNS_READY_BIT        BIT1
+#define DNS_FAILED_BIT       BIT2
+#define DNS_STOPPED_BIT      BIT3
+#define PROVISION_TIMEOUT_MS (5 * 60 * 1000)
+#define PROVISION_RESPONSE_GRACE_MS 2000
+#define DNS_START_TIMEOUT_MS    1000
+#define DNS_STOP_TIMEOUT_MS     1000
+#define DNS_RECEIVE_TIMEOUT_MS   250
 #define DNS_PORT                53
 #define DNS_BUFFER_SIZE         528
 
 static const char *TAG = "provisioning";
 static EventGroupHandle_t s_events;
 static esp_netif_t *s_ap_netif;
-static esp_netif_t *s_sta_netif;
-static esp_event_handler_instance_t s_wifi_handler;
-static esp_event_handler_instance_t s_ip_handler;
 static httpd_handle_t s_server;
 static TaskHandle_t s_dns_task_handle;
 static volatile bool s_dns_running;
-static volatile bool s_testing_credentials;
 static int s_dns_socket = -1;
-static unsigned s_connection_retries;
 
 static const char s_portal_html[] =
     "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -48,35 +48,33 @@ static const char s_portal_html[] =
     "main{max-width:420px;margin:auto;background:white;padding:24px;border-radius:14px;"
     "box-shadow:0 2px 14px #0002}h1{margin-top:0}label{display:block;margin-top:18px}"
     "input{box-sizing:border-box;width:100%;padding:12px;margin-top:6px;font-size:16px}"
+    "fieldset{border:0;padding:0;margin:20px 0 0}legend{font-weight:bold;font-size:18px}"
+    ".show{width:auto;padding:7px 11px;margin-top:8px;background:#666;font-size:14px}"
     "button{width:100%;padding:13px;margin-top:24px;font-size:16px;background:#111;color:white;"
     "border:0;border-radius:8px}</style></head><body><main><h1>Configure device</h1>"
     "<p>Enter the Wi-Fi network and Home Assistant MQTT broker.</p>"
-    "<form method=post action=/save><label>Network name (SSID)"
-    "<input name=ssid maxlength=32 required autocomplete='off'></label>"
-    "<label>Password<input name=password type=password maxlength=64 autocomplete='off'></label>"
+    "<form method=post action=/save autocomplete=off><fieldset><legend>Wi-Fi</legend>"
+    "<label for=wifi_ssid>Network name (SSID)</label>"
+    "<input id=wifi_ssid name=ssid maxlength=32 required autocapitalize=none "
+    "spellcheck=false autocomplete=off>"
+    "<label for=wifi_psk>Password Wi-Fi</label>"
+    "<input id=wifi_psk name=wifi_psk type=password maxlength=64 autocapitalize=none "
+    "spellcheck=false autocomplete='section-wifi new-password' data-lpignore=true "
+    "data-1p-ignore data-bwignore>"
+    "<button class=show type=button onclick=togglePassword('wifi_psk',this)>Show password</button>"
+    "</fieldset><fieldset><legend>MQTT</legend>"
     "<label>Broker MQTT<input name=mqtt_uri maxlength=127 required "
     "value='mqtt://192.168.2.99:1883' autocapitalize=off autocomplete='off'></label>"
     "<label>MQTT username<input name=mqtt_username maxlength=64 "
-    "autocapitalize=off autocomplete='off'></label>"
-    "<label>Password MQTT<input name=mqtt_password type=password maxlength=64 "
-    "autocomplete='off'></label>"
-    "<button type=submit>Save and verify</button></form></main></body></html>";
-
-static void provisioning_event(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    (void)arg;
-    (void)data;
-    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP && s_testing_credentials) {
-        xEventGroupSetBits(s_events, PROVISION_CONNECTED_BIT);
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED &&
-               s_testing_credentials) {
-        if (++s_connection_retries < 4) {
-            (void)esp_wifi_connect();
-        } else {
-            xEventGroupSetBits(s_events, PROVISION_FAILED_BIT);
-        }
-    }
-}
+    "autocapitalize=off autocomplete='section-mqtt username'></label>"
+    "<label>Password MQTT<input id=mqtt_password name=mqtt_password type=password maxlength=64 "
+    "autocomplete='section-mqtt current-password'></label>"
+    "<button class=show type=button onclick=togglePassword('mqtt_password',this)>Show password</button>"
+    "</fieldset><button type=submit>Save configuration</button></form>"
+    "<script>function togglePassword(id,button){var input=document.getElementById(id);"
+    "var show=input.type==='password';input.type=show?'text':'password';"
+    "button.textContent=show?'Hide password':'Show password'}</script>"
+    "</main></body></html>";
 
 static int hex_value(char value)
 {
@@ -156,7 +154,7 @@ static esp_err_t save_post(httpd_req_t *request)
     char mqtt_username[NETWORK_MQTT_USERNAME_SIZE];
     char mqtt_password[NETWORK_MQTT_PASSWORD_SIZE];
     if (!form_value(body, "ssid", ssid, sizeof(ssid)) || !ssid[0] ||
-        !form_value(body, "password", password, sizeof(password)) ||
+        !form_value(body, "wifi_psk", password, sizeof(password)) ||
         !form_value(body, "mqtt_uri", mqtt_uri, sizeof(mqtt_uri)) ||
         !form_value(body, "mqtt_username", mqtt_username, sizeof(mqtt_username)) ||
         !form_value(body, "mqtt_password", mqtt_password, sizeof(mqtt_password)) ||
@@ -166,37 +164,7 @@ static esp_err_t save_post(httpd_req_t *request)
                                    "Invalid Wi-Fi or MQTT settings");
     }
 
-    wifi_config_t station = {0};
-    memcpy(station.sta.ssid, ssid, strlen(ssid));
-    memcpy(station.sta.password, password, strlen(password));
-    station.sta.threshold.authmode = password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    station.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-
-    s_testing_credentials = false;
-    (void)esp_wifi_disconnect();
-    esp_err_t result = esp_wifi_set_config(WIFI_IF_STA, &station);
-    s_connection_retries = 0;
-    xEventGroupClearBits(s_events, PROVISION_CONNECTED_BIT | PROVISION_FAILED_BIT);
-    s_testing_credentials = result == ESP_OK;
-    if (s_testing_credentials) result = esp_wifi_connect();
-    EventBits_t bits = 0;
-    if (result == ESP_OK) {
-        bits = xEventGroupWaitBits(s_events, PROVISION_CONNECTED_BIT | PROVISION_FAILED_BIT,
-                                   pdFALSE, pdFALSE, pdMS_TO_TICKS(PROVISION_CONNECT_MS));
-    }
-    s_testing_credentials = false;
-
-    if (!(bits & PROVISION_CONNECTED_BIT)) {
-        ESP_LOGW(TAG, "credentials rejected for SSID '%s'", ssid);
-        httpd_resp_set_status(request, "503 Service Unavailable");
-        httpd_resp_set_type(request, "text/html; charset=utf-8");
-        return httpd_resp_send(request,
-            "<html><body><h2>Connection failed</h2>"
-            "<p>Check the SSID and password, then go back and try again.</p></body></html>",
-            HTTPD_RESP_USE_STRLEN);
-    }
-
-    result = network_save_wifi_credentials(ssid, password);
+    esp_err_t result = network_save_wifi_credentials(ssid, password);
     if (result == ESP_OK) {
         result = network_save_mqtt_config(mqtt_uri, mqtt_username, mqtt_password);
     }
@@ -208,7 +176,9 @@ static esp_err_t save_post(httpd_req_t *request)
     httpd_resp_set_type(request, "text/html; charset=utf-8");
     result = httpd_resp_send(request,
         "<html><body><h2>Configuration complete</h2>"
-        "<p>Wi-Fi and MQTT settings have been saved. You can close this page.</p></body></html>",
+        "<p>Wi-Fi and MQTT settings have been saved.</p>"
+        "<p>The setup network will now close and your phone may switch to another network. "
+        "This is expected.</p></body></html>",
         HTTPD_RESP_USE_STRLEN);
     xEventGroupSetBits(s_events, PROVISION_DONE_BIT);
     return result;
@@ -224,33 +194,38 @@ static esp_err_t redirect_404(httpd_req_t *request, httpd_err_code_t error)
 
 static void dns_server_task(void *argument)
 {
-    (void)argument;
+    EventGroupHandle_t events = argument;
     uint8_t packet[DNS_BUFFER_SIZE];
-    s_dns_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s_dns_socket < 0) {
-        ESP_LOGE(TAG, "cannot create DNS socket");
-        s_dns_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
+    int dns_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (dns_socket < 0) {
+        ESP_LOGE(TAG, "cannot create DNS socket: errno=%d", errno);
+        goto failed;
+    }
+    const struct timeval receive_timeout = {
+        .tv_sec = DNS_RECEIVE_TIMEOUT_MS / 1000,
+        .tv_usec = (DNS_RECEIVE_TIMEOUT_MS % 1000) * 1000,
+    };
+    if (setsockopt(dns_socket, SOL_SOCKET, SO_RCVTIMEO,
+                   &receive_timeout, sizeof(receive_timeout)) < 0) {
+        ESP_LOGE(TAG, "cannot set DNS receive timeout: errno=%d", errno);
+        goto failed;
     }
     const struct sockaddr_in address = {
         .sin_family = AF_INET,
         .sin_port = htons(DNS_PORT),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
-    if (bind(s_dns_socket, (const struct sockaddr *)&address, sizeof(address)) < 0) {
-        ESP_LOGE(TAG, "cannot bind DNS socket");
-        close(s_dns_socket);
-        s_dns_socket = -1;
-        s_dns_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
+    if (bind(dns_socket, (const struct sockaddr *)&address, sizeof(address)) < 0) {
+        ESP_LOGE(TAG, "cannot bind DNS socket: errno=%d", errno);
+        goto failed;
     }
+    s_dns_socket = dns_socket;
+    xEventGroupSetBits(events, DNS_READY_BIT);
 
     while (s_dns_running) {
         struct sockaddr_storage client;
         socklen_t client_length = sizeof(client);
-        const int length = recvfrom(s_dns_socket, packet, DNS_BUFFER_SIZE - 16, 0,
+        const int length = recvfrom(dns_socket, packet, DNS_BUFFER_SIZE - 16, 0,
                                     (struct sockaddr *)&client, &client_length);
         if (length < 17 || !s_dns_running) continue;
         if (packet[4] != 0 || packet[5] != 1) continue;
@@ -270,17 +245,31 @@ static void dns_server_task(void *argument)
             0x00, 0x3c, 0x00, 0x04, 192, 168, 4, 1
         };
         memcpy(packet + end, answer, sizeof(answer));
-        (void)sendto(s_dns_socket, packet, end + sizeof(answer), 0,
+        (void)sendto(dns_socket, packet, end + sizeof(answer), 0,
                      (struct sockaddr *)&client, client_length);
     }
-    if (s_dns_socket >= 0) close(s_dns_socket);
-    s_dns_socket = -1;
+    close(dns_socket);
+    if (s_dns_socket == dns_socket) s_dns_socket = -1;
     s_dns_task_handle = NULL;
+    xEventGroupSetBits(events, DNS_STOPPED_BIT);
+    vTaskDelete(NULL);
+    return;
+
+failed:
+    if (dns_socket >= 0) close(dns_socket);
+    if (s_dns_socket == dns_socket) s_dns_socket = -1;
+    s_dns_running = false;
+    s_dns_task_handle = NULL;
+    xEventGroupSetBits(events, DNS_FAILED_BIT | DNS_STOPPED_BIT);
     vTaskDelete(NULL);
 }
 
 static esp_err_t start_portal(void)
 {
+    if (s_dns_task_handle) {
+        ESP_LOGE(TAG, "previous DNS task is still active");
+        return ESP_ERR_INVALID_STATE;
+    }
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
     config.max_open_sockets = 6;
@@ -293,12 +282,18 @@ static esp_err_t start_portal(void)
                         TAG, "HTTP redirect");
 
     s_dns_running = true;
-    if (xTaskCreate(dns_server_task, "provision_dns", 3072, NULL, 4,
+    if (xTaskCreate(dns_server_task, "provision_dns", 3072, s_events, 4,
                     &s_dns_task_handle) != pdPASS) {
         s_dns_running = false;
         return ESP_ERR_NO_MEM;
     }
-    return ESP_OK;
+    const EventBits_t dns_bits = xEventGroupWaitBits(
+        s_events, DNS_READY_BIT | DNS_FAILED_BIT, pdTRUE, pdFALSE,
+        pdMS_TO_TICKS(DNS_START_TIMEOUT_MS));
+    if (dns_bits & DNS_READY_BIT) return ESP_OK;
+    s_dns_running = false;
+    ESP_LOGE(TAG, "DNS server did not start");
+    return ESP_FAIL;
 }
 
 static void stop_provisioning(void)
@@ -308,27 +303,27 @@ static void stop_provisioning(void)
         s_server = NULL;
     }
     s_dns_running = false;
-    if (s_dns_socket >= 0) {
-        shutdown(s_dns_socket, SHUT_RDWR);
+    const TaskHandle_t dns_task = s_dns_task_handle;
+    const int dns_socket = s_dns_socket;
+    if (dns_socket >= 0) {
+        shutdown(dns_socket, SHUT_RDWR);
     }
-    for (int i = 0; s_dns_task_handle && i < 20; ++i) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (dns_task && s_events) {
+        const EventBits_t dns_bits = xEventGroupWaitBits(
+            s_events, DNS_STOPPED_BIT, pdTRUE, pdFALSE,
+            pdMS_TO_TICKS(DNS_STOP_TIMEOUT_MS));
+        if (!(dns_bits & DNS_STOPPED_BIT) && s_dns_task_handle) {
+            ESP_LOGE(TAG, "DNS task did not stop; deleting it");
+            vTaskDelete(s_dns_task_handle);
+            s_dns_task_handle = NULL;
+            if (s_dns_socket >= 0) {
+                close(s_dns_socket);
+                s_dns_socket = -1;
+            }
+        }
     }
-    if (s_ip_handler) {
-        (void)esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, s_ip_handler);
-        s_ip_handler = NULL;
-    }
-    if (s_wifi_handler) {
-        (void)esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_wifi_handler);
-        s_wifi_handler = NULL;
-    }
-    (void)esp_wifi_disconnect();
     (void)esp_wifi_stop();
     (void)esp_wifi_deinit();
-    if (s_sta_netif) {
-        esp_netif_destroy_default_wifi(s_sta_netif);
-        s_sta_netif = NULL;
-    }
     if (s_ap_netif) {
         esp_netif_destroy_default_wifi(s_ap_netif);
         s_ap_netif = NULL;
@@ -346,8 +341,8 @@ esp_err_t provisioning_run(void)
     ESP_RETURN_ON_ERROR(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP), TAG, "read MAC");
     char ap_ssid[20];
     char ap_password[20];
-    snprintf(ap_ssid, sizeof(ap_ssid), "RHT-%02X%02X%02X", mac[3], mac[4], mac[5]);
-    snprintf(ap_password, sizeof(ap_password), "RHT%02X%02X%02X%02X",
+    snprintf(ap_ssid, sizeof(ap_ssid), "rht-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    snprintf(ap_password, sizeof(ap_password), "rht%02x%02x%02x%02x",
              mac[2], mac[3], mac[4], mac[5]);
 
     ESP_RETURN_ON_ERROR(epaper_show_provisioning(ap_ssid, ap_password),
@@ -357,8 +352,7 @@ esp_err_t provisioning_run(void)
     s_events = xEventGroupCreate();
     if (!s_events) return ESP_ERR_NO_MEM;
     s_ap_netif = esp_netif_create_default_wifi_ap();
-    s_sta_netif = esp_netif_create_default_wifi_sta();
-    if (!s_ap_netif || !s_sta_netif) {
+    if (!s_ap_netif) {
         stop_provisioning();
         return ESP_ERR_NO_MEM;
     }
@@ -367,12 +361,6 @@ esp_err_t provisioning_run(void)
     const wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     if ((result = esp_wifi_init(&init)) != ESP_OK) goto done;
     if ((result = esp_wifi_set_storage(WIFI_STORAGE_RAM)) != ESP_OK) goto done;
-    if ((result = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                       provisioning_event, NULL,
-                                                       &s_wifi_handler)) != ESP_OK) goto done;
-    if ((result = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                       provisioning_event, NULL,
-                                                       &s_ip_handler)) != ESP_OK) goto done;
 
     wifi_config_t access_point = {0};
     strlcpy((char *)access_point.ap.ssid, ap_ssid, sizeof(access_point.ap.ssid));
@@ -381,7 +369,7 @@ esp_err_t provisioning_run(void)
     access_point.ap.channel = 1;
     access_point.ap.max_connection = 4;
     access_point.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    if ((result = esp_wifi_set_mode(WIFI_MODE_APSTA)) != ESP_OK) goto done;
+    if ((result = esp_wifi_set_mode(WIFI_MODE_AP)) != ESP_OK) goto done;
     if ((result = esp_wifi_set_config(WIFI_IF_AP, &access_point)) != ESP_OK) goto done;
     if ((result = esp_wifi_start()) != ESP_OK) goto done;
 
@@ -399,7 +387,9 @@ esp_err_t provisioning_run(void)
                                                  pdMS_TO_TICKS(PROVISION_TIMEOUT_MS));
     result = (bits & PROVISION_DONE_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
     if (result == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(750));
+        /* Keep the AP alive long enough for the phone to receive and render
+         * the confirmation before the setup network disappears. */
+        vTaskDelay(pdMS_TO_TICKS(PROVISION_RESPONSE_GRACE_MS));
     }
 
 done:

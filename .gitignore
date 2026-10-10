@@ -1,7 +1,16 @@
 /build/
+/build-c6/
+/build-s3/
+/build-*/
+/.codex-remote-attachments/
 /managed_components/
 /sdkconfig
 /sdkconfig.old
+/sdkconfig.c6
+/sdkconfig.s3
+/sdkconfig.*.old
+/stats-*.bin
+/release/
 /tmp/
 __pycache__/
 *.py[cod]

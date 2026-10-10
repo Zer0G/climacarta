@@ -1,0 +1,91 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ClimaCarta: Build (scegli target)",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& '${config:idf.currentSetup}\\export.ps1'; idf.py --preset '${input:climacartaTarget}' build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": ["$gcc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "ClimaCarta: Menuconfig (scegli target)",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& '${config:idf.currentSetup}\\export.ps1'; idf.py --preset '${input:climacartaTarget}' menuconfig"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "ClimaCarta: Build + Flash + Monitor (scegli target)",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& '${config:idf.currentSetup}\\export.ps1'; idf.py --preset '${input:climacartaTarget}' -p '${input:climacartaPort}' build flash monitor"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "climacartaTarget",
+      "type": "pickString",
+      "description": "Scheda ClimaCarta da usare",
+      "options": [
+        "c6",
+        "s3"
+      ],
+      "default": "s3"
+    },
+    {
+      "id": "climacartaPort",
+      "type": "promptString",
+      "description": "Porta seriale della scheda (es. COM7)"
+    }
+  ]
+}
