@@ -20,9 +20,18 @@ config RHT_MQTT_PASSWORD
     string "MQTT password"
     default ""
 
-config RHT_MQTT_BASE_TOPIC
-    string "MQTT base topic"
-    default "homeassistant/sensor/rht_epaper"
+config RHT_MQTT_DISCOVERY_PREFIX
+    string "Home Assistant MQTT discovery prefix"
+    default "homeassistant"
+    help
+        Must match the discovery prefix configured in Home Assistant.
+
+config RHT_MQTT_DATA_PREFIX
+    string "MQTT data prefix"
+    default "climacarta"
+    help
+        Operational topics are placed below this prefix and a device id
+        derived from the Wi-Fi station MAC address.
 
 config RHT_OTA_MANIFEST_URL
     string "GitHub OTA manifest URL"
@@ -31,10 +40,6 @@ config RHT_OTA_MANIFEST_URL
     help
         Public HTTPS URL of the target-specific GitHub Releases manifest. The
         manifest must contain board, version, url, and sha256 string fields.
-
-config RHT_DEVICE_ID
-    string "Home Assistant device id"
-    default "rht_epaper"
 
 config RHT_NTP_SERVER
     string "NTP server"

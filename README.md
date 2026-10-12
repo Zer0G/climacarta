@@ -167,10 +167,16 @@ while the device is already awake.
 With the default configuration:
 
 ~~~text
-state:     homeassistant/sensor/rht_epaper/state
-discovery: homeassistant/sensor/rht_epaper/<entity>/config
-commands:  homeassistant/sensor/rht_epaper/command
+device id: climacarta_<12 hexadecimal digits from the Wi-Fi MAC>
+state:     climacarta/<device_id>/state
+commands:  climacarta/<device_id>/command
+discovery: homeassistant/<component>/<device_id>/<entity>/config
 ~~~
+
+The device id is generated at runtime from the complete Wi-Fi station MAC, so
+multiple boards flashed with the same firmware never share discovery, state,
+command, or MQTT client identifiers. Sensor, number, and firmware-update
+entities use their corresponding Home Assistant MQTT component types.
 
 The retained QoS 1 state JSON contains temperature, humidity, dew point, daily
 minimum and maximum, battery percentage and voltage in millivolts, RSSI, plus values and
@@ -180,6 +186,13 @@ previous week, month, and year.
 Discovery messages are published after the first successful MQTT connection,
 after new provisioning, and at least every 24 hours thereafter. Historical
 periods that are not available yet are published as 'null'.
+
+Firmware up to v0.1.13 used the shared `homeassistant/sensor/rht_epaper`
+namespace. After all boards have been upgraded, remove the retained messages
+below that legacy namespace with an MQTT administration client and delete any
+stale legacy device from Home Assistant. MQTT does not support deleting a
+whole retained subtree with a wildcard publish, so each retained `config` and
+state topic must be cleared or removed with a broker UI such as MQTT Explorer.
 
 ## Build and flash
 
@@ -229,11 +242,15 @@ starting the download. See the two examples in `ota/`:
 }
 ~~~
 
-After building both targets, generate all four release assets with:
+After building both targets, generate the four target-specific release assets with:
 
 ~~~powershell
 python tools/package_ota_release.py 1.0.0
 ~~~
+
+The packager also creates the legacy ESP32-C6 aliases `manifest.json` and
+`rht_sensor.bin`. Keep these two files in the release so firmware installed
+before the multi-board split can migrate through OTA.
 
 Upload the contents of `release/` to the matching `v1.0.0` GitHub Release. The
 device verifies the board ID, manifest, image transport, and SHA-256 digest,

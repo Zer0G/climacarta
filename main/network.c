@@ -8,6 +8,7 @@
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_wifi.h"
@@ -18,6 +19,7 @@
 #include "nvs.h"
 #include "sdkconfig.h"
 #include "settings.h"
+#include "board_config.h"
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAILED_BIT    BIT1
@@ -35,6 +37,14 @@ static int s_wifi_retries;
 static volatile int s_last_published_id;
 static volatile bool s_ota_requested;
 
+#define MQTT_DEVICE_ID_SIZE 24
+#define MQTT_DEVICE_NAME_SIZE 40
+#define MQTT_DATA_BASE_SIZE 96
+
+static char s_device_id[MQTT_DEVICE_ID_SIZE];
+static char s_device_name[MQTT_DEVICE_NAME_SIZE];
+static char s_data_base[MQTT_DATA_BASE_SIZE];
+
 #define WIFI_NVS_NAMESPACE "rht_wifi"
 #define WIFI_NVS_SSID_KEY  "ssid"
 #define WIFI_NVS_PASS_KEY  "password"
@@ -42,6 +52,30 @@ static volatile bool s_ota_requested;
 #define MQTT_NVS_URI_KEY   "uri"
 #define MQTT_NVS_USER_KEY  "username"
 #define MQTT_NVS_PASS_KEY  "password"
+
+static esp_err_t mqtt_init_identity(void)
+{
+    if (s_device_id[0]) {
+        return ESP_OK;
+    }
+
+    uint8_t mac[6];
+    ESP_RETURN_ON_ERROR(esp_read_mac(mac, ESP_MAC_WIFI_STA), TAG,
+                        "read Wi-Fi station MAC");
+    snprintf(s_device_id, sizeof(s_device_id),
+             "climacarta_%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    snprintf(s_device_name, sizeof(s_device_name), "ClimaCarta %02X%02X%02X",
+             mac[3], mac[4], mac[5]);
+    const int written = snprintf(s_data_base, sizeof(s_data_base), "%s/%s",
+                                 CONFIG_RHT_MQTT_DATA_PREFIX, s_device_id);
+    if (written < 0 || (size_t)written >= sizeof(s_data_base)) {
+        s_device_id[0] = '\0';
+        return ESP_ERR_INVALID_SIZE;
+    }
+    ESP_LOGI(TAG, "MQTT identity: id=%s base=%s", s_device_id, s_data_base);
+    return ESP_OK;
+}
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -364,6 +398,16 @@ static esp_err_t publish_wait(esp_mqtt_client_handle_t client, const char *topic
     return ESP_ERR_TIMEOUT;
 }
 
+static esp_err_t make_discovery_topic(char *topic, size_t topic_size,
+                                      const char *component, const char *key)
+{
+    const int written = snprintf(topic, topic_size, "%s/%s/%s/%s/config",
+                                 CONFIG_RHT_MQTT_DISCOVERY_PREFIX, component,
+                                 s_device_id, key);
+    return written >= 0 && (size_t)written < topic_size ?
+        ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
 static esp_err_t publish_discovery(esp_mqtt_client_handle_t client, const char *key,
                                    const char *name, const char *unit,
                                    const char *device_class, const char *state_class)
@@ -372,16 +416,18 @@ static esp_err_t publish_discovery(esp_mqtt_client_handle_t client, const char *
     /* Discovery runs synchronously from the main task. Keep the large JSON
      * buffer out of its 4 KiB stack. */
     static char payload[768];
-    snprintf(topic, sizeof(topic), "%s/%s/config", CONFIG_RHT_MQTT_BASE_TOPIC, key);
+    ESP_RETURN_ON_ERROR(make_discovery_topic(topic, sizeof(topic), "sensor", key),
+                        TAG, "sensor discovery topic");
     snprintf(payload, sizeof(payload),
              "{\"name\":\"%s\",\"unique_id\":\"%s_%s\","
              "\"state_topic\":\"%s/state\",\"value_template\":\"{{ value_json.%s }}\","
              "\"unit_of_measurement\":\"%s\",\"device_class\":\"%s\","
              "\"state_class\":\"%s\",\"device\":{\"identifiers\":[\"%s\"],"
-             "\"name\":\"RHT ePaper\",\"manufacturer\":\"Waveshare\","
-             "\"model\":\"ESP32-C6-ePaper-1.54\"}}",
-             name, CONFIG_RHT_DEVICE_ID, key, CONFIG_RHT_MQTT_BASE_TOPIC, key,
-             unit, device_class, state_class, CONFIG_RHT_DEVICE_ID);
+             "\"name\":\"%s\",\"manufacturer\":\"Waveshare\","
+             "\"model\":\"%s\"}}",
+             name, s_device_id, key, s_data_base, key,
+             unit, device_class, state_class, s_device_id,
+             s_device_name, BOARD_MODEL_NAME);
     return publish_wait(client, topic, payload, 1, true);
 }
 
@@ -389,25 +435,27 @@ static esp_err_t publish_firmware_discovery(esp_mqtt_client_handle_t client)
 {
     char topic[192];
     static char payload[768];
-    snprintf(topic, sizeof(topic), "%s/firmware_version/config",
-             CONFIG_RHT_MQTT_BASE_TOPIC);
+    ESP_RETURN_ON_ERROR(make_discovery_topic(topic, sizeof(topic), "sensor",
+                                             "firmware_version"),
+                        TAG, "firmware discovery topic");
     snprintf(payload, sizeof(payload),
              "{\"name\":\"Firmware version\",\"unique_id\":\"%s_firmware_version\"," 
              "\"state_topic\":\"%s/firmware_version/state\","
              "\"icon\":\"mdi:chip\",\"device\":{\"identifiers\":[\"%s\"],"
-             "\"name\":\"RHT ePaper\",\"manufacturer\":\"Waveshare\","
-             "\"model\":\"ESP32-C6-ePaper-1.54\"}}",
-             CONFIG_RHT_DEVICE_ID, CONFIG_RHT_MQTT_BASE_TOPIC,
-             CONFIG_RHT_DEVICE_ID);
+             "\"name\":\"%s\",\"manufacturer\":\"Waveshare\","
+             "\"model\":\"%s\"}}",
+             s_device_id, s_data_base, s_device_id,
+             s_device_name, BOARD_MODEL_NAME);
     return publish_wait(client, topic, payload, 1, true);
 }
 
 static esp_err_t publish_update_discovery(esp_mqtt_client_handle_t client)
 {
     char topic[192];
-    static char payload[768];
-    snprintf(topic, sizeof(topic), "%s/firmware_update/config",
-             CONFIG_RHT_MQTT_BASE_TOPIC);
+    static char payload[1024];
+    ESP_RETURN_ON_ERROR(make_discovery_topic(topic, sizeof(topic), "update",
+                                             "firmware_update"),
+                        TAG, "update discovery topic");
     snprintf(payload, sizeof(payload),
              "{\"name\":\"Firmware update\",\"unique_id\":\"%s_firmware_update\","
              "\"state_topic\":\"%s/firmware_update/state\","
@@ -416,11 +464,11 @@ static esp_err_t publish_update_discovery(esp_mqtt_client_handle_t client)
              "\"latest_version_template\":\"{{ value_json.latest_version }}\","
              "\"command_topic\":\"%s/command\",\"payload_install\":\"ota_install\","
              "\"device_class\":\"firmware\",\"release_url\":\"https://github.com/zer0g/climacarta/releases\","
-             "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"RHT ePaper\","
-             "\"manufacturer\":\"Waveshare\",\"model\":\"ESP32-C6-ePaper-1.54\"}}",
-             CONFIG_RHT_DEVICE_ID, CONFIG_RHT_MQTT_BASE_TOPIC,
-             CONFIG_RHT_MQTT_BASE_TOPIC, CONFIG_RHT_MQTT_BASE_TOPIC,
-             CONFIG_RHT_DEVICE_ID);
+             "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\","
+             "\"manufacturer\":\"Waveshare\",\"model\":\"%s\"}}",
+             s_device_id, s_data_base,
+             s_data_base, s_data_base,
+             s_device_id, s_device_name, BOARD_MODEL_NAME);
     return publish_wait(client, topic, payload, 1, true);
 }
 
@@ -428,25 +476,29 @@ static esp_err_t publish_runtime_settings_discovery(esp_mqtt_client_handle_t cli
 {
     char topic[192];
     static char payload[768];
-    snprintf(topic, sizeof(topic), "%s/t_sample/config", CONFIG_RHT_MQTT_BASE_TOPIC);
+    ESP_RETURN_ON_ERROR(make_discovery_topic(topic, sizeof(topic), "number",
+                                             "t_sample"),
+                        TAG, "sample interval discovery topic");
     snprintf(payload, sizeof(payload),
              "{\"name\":\"Sample interval\",\"unique_id\":\"%s_t_sample\","
              "\"state_topic\":\"%s/settings/state\",\"value_template\":\"{{ value_json.t_sample }}\","
              "\"command_topic\":\"%s/command\",\"command_template\":\"t_sample={{ value }}\","
              "\"unit_of_measurement\":\"s\",\"min\":10,\"max\":86400,\"step\":1,\"mode\":\"box\","
-             "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"RHT ePaper\"}}",
-             CONFIG_RHT_DEVICE_ID, CONFIG_RHT_MQTT_BASE_TOPIC,
-             CONFIG_RHT_MQTT_BASE_TOPIC, CONFIG_RHT_DEVICE_ID);
+             "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\"}}",
+             s_device_id, s_data_base,
+             s_data_base, s_device_id, s_device_name);
     if (publish_wait(client, topic, payload, 1, true) != ESP_OK) return ESP_FAIL;
-    snprintf(topic, sizeof(topic), "%s/update_freq/config", CONFIG_RHT_MQTT_BASE_TOPIC);
+    ESP_RETURN_ON_ERROR(make_discovery_topic(topic, sizeof(topic), "number",
+                                             "update_freq"),
+                        TAG, "update frequency discovery topic");
     snprintf(payload, sizeof(payload),
              "{\"name\":\"MQTT update frequency\",\"unique_id\":\"%s_update_freq\","
              "\"state_topic\":\"%s/settings/state\",\"value_template\":\"{{ value_json.update_freq }}\","
              "\"command_topic\":\"%s/command\",\"command_template\":\"update_freq={{ value }}\","
              "\"unit_of_measurement\":\"samples\",\"min\":0,\"max\":255,\"step\":1,\"mode\":\"box\","
-             "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"RHT ePaper\"}}",
-             CONFIG_RHT_DEVICE_ID, CONFIG_RHT_MQTT_BASE_TOPIC,
-             CONFIG_RHT_MQTT_BASE_TOPIC, CONFIG_RHT_DEVICE_ID);
+             "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\"}}",
+             s_device_id, s_data_base,
+             s_data_base, s_device_id, s_device_name);
     return publish_wait(client, topic, payload, 1, true);
 }
 
@@ -475,13 +527,14 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
                                  mqtt_password, sizeof(mqtt_password))) {
         return ESP_ERR_INVALID_ARG;
     }
+    ESP_RETURN_ON_ERROR(mqtt_init_identity(), TAG, "initialize MQTT identity");
     s_mqtt_events = xEventGroupCreate();
     if (!s_mqtt_events) {
         return ESP_ERR_NO_MEM;
     }
     const esp_mqtt_client_config_t config = {
         .broker.address.uri = mqtt_uri,
-        .credentials.client_id = CONFIG_RHT_DEVICE_ID,
+        .credentials.client_id = s_device_id,
         .credentials.username = mqtt_username[0] ? mqtt_username : NULL,
         .credentials.authentication.password = mqtt_password[0] ? mqtt_password : NULL,
         .network.disable_auto_reconnect = true,
@@ -509,8 +562,7 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
     static const char celsius[] = "\xC2\xB0" "C";
     if (result == ESP_OK) {
         char command_topic[192];
-        snprintf(command_topic, sizeof(command_topic), "%s/command",
-                 CONFIG_RHT_MQTT_BASE_TOPIC);
+        snprintf(command_topic, sizeof(command_topic), "%s/command", s_data_base);
         if (esp_mqtt_client_subscribe(client, command_topic, 1) < 0) {
             result = ESP_FAIL;
         }
@@ -559,14 +611,14 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
         const esp_app_desc_t *app = esp_app_get_description();
         char firmware_topic[192];
         snprintf(firmware_topic, sizeof(firmware_topic),
-                 "%s/firmware_version/state", CONFIG_RHT_MQTT_BASE_TOPIC);
+                 "%s/firmware_version/state", s_data_base);
         result = publish_wait(client, firmware_topic, app->version, 1, true);
     }
     if (result == ESP_OK) {
         char update_topic[192];
         static char update_payload[192];
         snprintf(update_topic, sizeof(update_topic),
-                 "%s/firmware_update/state", CONFIG_RHT_MQTT_BASE_TOPIC);
+                 "%s/firmware_update/state", s_data_base);
         snprintf(update_payload, sizeof(update_payload),
                  "{\"installed_version\":\"%s\",\"latest_version\":\"%s\"}",
                  measurement->installed_version, measurement->latest_version);
@@ -576,7 +628,7 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
         char settings_topic[192];
         static char settings_payload[96];
         snprintf(settings_topic, sizeof(settings_topic), "%s/settings/state",
-                 CONFIG_RHT_MQTT_BASE_TOPIC);
+                 s_data_base);
         snprintf(settings_payload, sizeof(settings_payload),
                  "{\"t_sample\":%lu,\"update_freq\":%lu}",
                  (unsigned long)settings_get_t_sample(),
@@ -588,7 +640,7 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
         /* MQTT publication is serialized, so a static buffer is safe and
          * avoids nesting another large allocation on the main task stack. */
         static char payload[1280];
-        snprintf(topic, sizeof(topic), "%s/state", CONFIG_RHT_MQTT_BASE_TOPIC);
+        snprintf(topic, sizeof(topic), "%s/state", s_data_base);
         const int base_length = snprintf(payload, sizeof(payload),
                  "{\"timestamp\":%" PRIi64 ",\"firmware_version\":\"%s\",\"temperature\":%.2f,\"humidity\":%.2f,"
                  "\"dew_point\":%.2f,\"day_min\":%.2f,\"day_max\":%.2f,"
