@@ -178,6 +178,25 @@ multiple boards flashed with the same firmware never share discovery, state,
 command, or MQTT client identifiers. Sensor, number, and firmware-update
 entities use their corresponding Home Assistant MQTT component types.
 
+Every device also subscribes to the retained broadcast topic:
+
+~~~text
+climacarta/broadcast/command
+~~~
+
+An OTA broadcast must include a version newer than the installed firmware:
+
+~~~json
+{"command":"ota_install","version":"0.1.15"}
+~~~
+
+The retained request can remain on the broker: devices that already run the
+requested version (or a newer one) ignore it without contacting GitHub. Each
+device acknowledges an accepted request and later reports its running version
+on `climacarta/<device_id>/ota/status`. An individual OTA command published by
+the Home Assistant update entity is retained and cleared by the device after
+it has been accepted; the shared broadcast is never cleared by a device.
+
 The retained QoS 1 state JSON contains temperature, humidity, dew point, daily
 minimum and maximum, battery percentage and voltage in millivolts, RSSI, plus values and
 deltas for the previous hour, the same hour on the previous day, and the

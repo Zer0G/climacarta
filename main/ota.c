@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "board_config.h"
@@ -23,6 +24,42 @@
 #define OTA_HTTP_BUFFER_SIZE  4096
 
 static const char *TAG = "ota";
+
+static const char *skip_version_prefix(const char *version)
+{
+    return version && (*version == 'v' || *version == 'V') ? version + 1 : version;
+}
+
+static int compare_versions(const char *left, const char *right)
+{
+    left = skip_version_prefix(left);
+    right = skip_version_prefix(right);
+    if (!left || !right || !*left || !*right) {
+        return left && *left ? 1 : (right && *right ? -1 : 0);
+    }
+
+    while (*left || *right) {
+        if ((*left && !isdigit((unsigned char)*left)) ||
+            (*right && !isdigit((unsigned char)*right))) {
+            return strcmp(left, right);
+        }
+        char *left_end;
+        char *right_end;
+        const unsigned long left_part = strtoul(left, &left_end, 10);
+        const unsigned long right_part = strtoul(right, &right_end, 10);
+        if (left_part != right_part) {
+            return left_part > right_part ? 1 : -1;
+        }
+        left = *left_end == '.' ? left_end + 1 : left_end;
+        right = *right_end == '.' ? right_end + 1 : right_end;
+    }
+    return 0;
+}
+
+bool ota_version_is_newer(const char *candidate, const char *current)
+{
+    return compare_versions(candidate, current) > 0;
+}
 
 static bool json_string(const char *json, const char *key,
                         char *output, size_t output_size)
@@ -220,8 +257,9 @@ esp_err_t ota_install_from_github(ota_progress_cb_t progress_callback)
     }
 
     const esp_app_desc_t *current = esp_app_get_description();
-    if (!strcmp(current->version, version)) {
-        ESP_LOGI(TAG, "firmware %s is already installed", version);
+    if (!ota_version_is_newer(version, current->version)) {
+        ESP_LOGI(TAG, "firmware %s is not newer than installed %s",
+                 version, current->version);
         return ESP_ERR_NOT_FOUND;
     }
 

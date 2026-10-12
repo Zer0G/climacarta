@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "mqtt_client.h"
 #include "nvs.h"
+#include "ota.h"
 #include "sdkconfig.h"
 #include "settings.h"
 #include "board_config.h"
@@ -40,10 +41,14 @@ static volatile bool s_ota_requested;
 #define MQTT_DEVICE_ID_SIZE 24
 #define MQTT_DEVICE_NAME_SIZE 40
 #define MQTT_DATA_BASE_SIZE 96
+#define MQTT_BROADCAST_TOPIC_SIZE 96
 
 static char s_device_id[MQTT_DEVICE_ID_SIZE];
 static char s_device_name[MQTT_DEVICE_NAME_SIZE];
 static char s_data_base[MQTT_DATA_BASE_SIZE];
+static char s_broadcast_topic[MQTT_BROADCAST_TOPIC_SIZE];
+static char s_ota_requested_version[OTA_VERSION_MAX_SIZE];
+static bool s_ota_request_broadcast;
 
 #define WIFI_NVS_NAMESPACE "rht_wifi"
 #define WIFI_NVS_SSID_KEY  "ssid"
@@ -70,6 +75,15 @@ static esp_err_t mqtt_init_identity(void)
     const int written = snprintf(s_data_base, sizeof(s_data_base), "%s/%s",
                                  CONFIG_RHT_MQTT_DATA_PREFIX, s_device_id);
     if (written < 0 || (size_t)written >= sizeof(s_data_base)) {
+        s_device_id[0] = '\0';
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const int broadcast_written = snprintf(s_broadcast_topic,
+                                            sizeof(s_broadcast_topic),
+                                            "%s/broadcast/command",
+                                            CONFIG_RHT_MQTT_DATA_PREFIX);
+    if (broadcast_written < 0 ||
+        (size_t)broadcast_written >= sizeof(s_broadcast_topic)) {
         s_device_id[0] = '\0';
         return ESP_ERR_INVALID_SIZE;
     }
@@ -363,9 +377,49 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             command[command_length] = '\0';
         }
         if (strstr(command, "ota_install") || strstr(command, "ota_check")) {
-            s_ota_requested = strstr(command, "ota_install") != NULL;
-            ESP_LOGI(TAG, "OTA command received: %s",
-                     s_ota_requested ? "install" : "check");
+            const bool install = strstr(command, "ota_install") != NULL;
+            const bool broadcast = event->topic_len == (int)strlen(s_broadcast_topic) &&
+                memcmp(event->topic, s_broadcast_topic, (size_t)event->topic_len) == 0;
+            char requested_version[OTA_VERSION_MAX_SIZE] = {0};
+            const char *version_key = strstr(command, "\"version\"");
+            if (version_key) {
+                const char *colon = strchr(version_key, ':');
+                if (colon) {
+                    const char *quote = strchr(colon, '\"');
+                    if (quote) {
+                        ++quote;
+                        const char *end = strchr(quote, '\"');
+                        if (end) {
+                            size_t length = (size_t)(end - quote);
+                            if (length >= sizeof(requested_version)) {
+                                length = sizeof(requested_version) - 1U;
+                            }
+                            memcpy(requested_version, quote, length);
+                            requested_version[length] = '\0';
+                        }
+                    }
+                }
+            }
+
+            if (!install) {
+                ESP_LOGI(TAG, "OTA check command received");
+            } else if (broadcast && !requested_version[0]) {
+                ESP_LOGW(TAG, "ignored unversioned OTA broadcast");
+            } else if (requested_version[0] &&
+                       !ota_version_is_newer(requested_version,
+                                             esp_app_get_description()->version)) {
+                ESP_LOGI(TAG, "ignored OTA %s; installed version is %s",
+                         requested_version, esp_app_get_description()->version);
+            } else {
+                s_ota_requested = true;
+                s_ota_request_broadcast = broadcast;
+                strlcpy(s_ota_requested_version,
+                        requested_version[0] ? requested_version : "latest",
+                        sizeof(s_ota_requested_version));
+                ESP_LOGI(TAG, "OTA install accepted from %s topic, version=%s",
+                         broadcast ? "broadcast" : "device",
+                         s_ota_requested_version);
+            }
         } else if (settings_apply_command(command)) {
             ESP_LOGI(TAG, "runtime setting updated: %s", command);
         }
@@ -463,6 +517,7 @@ static esp_err_t publish_update_discovery(esp_mqtt_client_handle_t client)
              "\"latest_version_topic\":\"%s/firmware_update/state\","
              "\"latest_version_template\":\"{{ value_json.latest_version }}\","
              "\"command_topic\":\"%s/command\",\"payload_install\":\"ota_install\","
+             "\"retain\":true,"
              "\"device_class\":\"firmware\",\"release_url\":\"https://github.com/zer0g/climacarta/releases\","
              "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\","
              "\"manufacturer\":\"Waveshare\",\"model\":\"%s\"}}",
@@ -563,7 +618,8 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
     if (result == ESP_OK) {
         char command_topic[192];
         snprintf(command_topic, sizeof(command_topic), "%s/command", s_data_base);
-        if (esp_mqtt_client_subscribe(client, command_topic, 1) < 0) {
+        if (esp_mqtt_client_subscribe(client, command_topic, 1) < 0 ||
+            esp_mqtt_client_subscribe(client, s_broadcast_topic, 1) < 0) {
             result = ESP_FAIL;
         }
     }
@@ -636,6 +692,15 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
         result = publish_wait(client, settings_topic, settings_payload, 1, true);
     }
     if (result == ESP_OK) {
+        char status_topic[192];
+        char status_payload[128];
+        snprintf(status_topic, sizeof(status_topic), "%s/ota/status", s_data_base);
+        snprintf(status_payload, sizeof(status_payload),
+                 "{\"status\":\"idle\",\"installed_version\":\"%s\"}",
+                 esp_app_get_description()->version);
+        result = publish_wait(client, status_topic, status_payload, 1, true);
+    }
+    if (result == ESP_OK) {
         char topic[192];
         /* MQTT publication is serialized, so a static buffer is safe and
          * avoids nesting another large allocation on the main task stack. */
@@ -678,6 +743,23 @@ esp_err_t network_publish(const network_measurement_t *measurement, bool send_di
     if (result == ESP_OK) {
         (void)xEventGroupWaitBits(s_mqtt_events, MQTT_DATA_BIT, pdTRUE, pdFALSE,
                                   pdMS_TO_TICKS(750));
+        if (s_ota_requested) {
+            char status_topic[192];
+            char status_payload[192];
+            snprintf(status_topic, sizeof(status_topic), "%s/ota/status", s_data_base);
+            snprintf(status_payload, sizeof(status_payload),
+                     "{\"status\":\"accepted\",\"requested_version\":\"%s\","
+                     "\"installed_version\":\"%s\"}",
+                     s_ota_requested_version,
+                     esp_app_get_description()->version);
+            (void)publish_wait(client, status_topic, status_payload, 1, true);
+            if (!s_ota_request_broadcast) {
+                char command_topic[192];
+                snprintf(command_topic, sizeof(command_topic), "%s/command",
+                         s_data_base);
+                (void)publish_wait(client, command_topic, "", 1, true);
+            }
+        }
     }
 
     if (started) {
