@@ -273,43 +273,6 @@ static bool periodic_transmission_due(time_t now, uint32_t sample_interval,
     return sample_slot % update_multiplier == 0;
 }
 
-static void refresh_delta_page(const epaper_view_t *base_view)
-{
-    if (!base_view) {
-        return;
-    }
-
-    epaper_view_t view = *base_view;
-    float delta = 0;
-    const char *delta_label = "DELTA";
-    view.page = s_state.page;
-    view.delta_valid = view.time_valid &&
-        stats_delta_reference(&s_state.stats, 0, view.timestamp,
-                              view.temperature_c, &delta, &delta_label);
-    view.delta_c = delta;
-    view.delta_label = delta_label;
-    if (s_state.page == 1 && view.time_valid) {
-        for (uint8_t i = 0; i < 4; ++i) {
-            const char *ignored_label = NULL;
-            view.history_valid[i] = stats_delta_reference(&s_state.stats, i + 1U,
-                view.timestamp, view.temperature_c, &view.history_delta_c[i],
-                &ignored_label);
-        }
-        view.chart_count = stats_battery_chart(&s_state.stats, view.timestamp,
-                                               view.chart_values,
-                                               EPAPER_CHART_MAX_POINTS,
-                                               &view.chart_span_days);
-    } else {
-        view.chart_count = 0;
-    }
-    view.wifi_connected = s_state.last_wifi_connected;
-
-    ESP_LOGI(TAG, "BOOT: delta page %u/5 (%s)",
-             (unsigned)(s_state.page + 1U), delta_label);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epaper_show(&view));
-    epaper_shutdown();
-}
-
 static bool capture_startup_boot_press(TickType_t *pressed_since)
 {
     const gpio_config_t boot_button = {
@@ -351,7 +314,7 @@ static bool boot_button_held_for_provisioning(bool startup_press_detected,
     return false;
 }
 
-static void wait_for_next_cycle(time_t now, const epaper_view_t *current_view)
+static bool wait_for_next_cycle(time_t now)
 {
     epaper_shutdown();
     network_disconnect();
@@ -368,7 +331,7 @@ static void wait_for_next_cycle(time_t now, const epaper_view_t *current_view)
             while (gpio_get_level(BOARD_BUTTON_POWER_GPIO) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
             }
-            return;
+            return false;
         }
         force_sleep = true;
     }
@@ -385,7 +348,7 @@ static void wait_for_next_cycle(time_t now, const epaper_view_t *current_view)
                 } else {
                     ESP_ERROR_CHECK_WITHOUT_ABORT(result);
                 }
-                return;
+                return false;
             }
             if (s_power_sleep_requested ||
                 gpio_get_level(BOARD_BUTTON_POWER_GPIO) == 0) {
@@ -395,7 +358,7 @@ static void wait_for_next_cycle(time_t now, const epaper_view_t *current_view)
                     while (gpio_get_level(BOARD_BUTTON_POWER_GPIO) == 0) {
                         vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
                     }
-                    return;
+                    return false;
                 }
                 ESP_LOGI(TAG, "POWER pressed while USB is connected: entering deep sleep");
                 while (gpio_get_level(BOARD_BUTTON_POWER_GPIO) == 0) {
@@ -424,11 +387,12 @@ static void wait_for_next_cycle(time_t now, const epaper_view_t *current_view)
                 while (gpio_get_level(BOARD_BUTTON_BOOT_GPIO) == 0) {
                     vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
                 }
-                return;
+                return false;
             } else if (!button_pressed && button_pressed_before) {
                 s_state.page = (s_state.page + 1U) % 2U;
-                refresh_delta_page(current_view);
-                button_pressed_before = false;
+                ESP_LOGI(TAG, "BOOT interaction: selected page %u; refreshing all data",
+                         (unsigned)(s_state.page + 1U));
+                return true;
             }
             vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
         }
@@ -458,6 +422,7 @@ static void wait_for_next_cycle(time_t now, const epaper_view_t *current_view)
     ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(DEEP_SLEEP_WAKE_MASK,
                                                     ESP_EXT1_WAKEUP_ANY_LOW));
     esp_deep_sleep_start();
+    return false;
 }
 
 static void enter_startup_failure_sleep(esp_err_t error)
@@ -571,7 +536,7 @@ void app_main(void)
         };
         ESP_ERROR_CHECK_WITHOUT_ABORT(epaper_show(&unavailable_view));
         time(&now);
-        wait_for_next_cycle(now, &unavailable_view);
+        manual_button_wakeup = wait_for_next_cycle(now);
         continue;
     }
     float battery_voltage = 0;
@@ -753,6 +718,6 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(epaper_show(&view));
 
     time(&now);
-    wait_for_next_cycle(now, &view);
+    manual_button_wakeup = wait_for_next_cycle(now);
     }
 }
