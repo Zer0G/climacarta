@@ -62,6 +62,10 @@ static const char *TAG = "rht_sensor";
 static volatile bool s_power_sleep_requested;
 static volatile bool s_power_press_seen;
 static volatile TickType_t s_power_pressed_since;
+static volatile bool s_user_press_seen;
+static volatile bool s_user_release_seen;
+static volatile TickType_t s_user_pressed_since;
+static volatile TickType_t s_user_released_at;
 
 typedef struct {
     TaskHandle_t waiter;
@@ -76,6 +80,20 @@ static void IRAM_ATTR power_button_isr(void *argument)
     s_power_sleep_requested = true;
 }
 
+static void IRAM_ATTR user_button_isr(void *argument)
+{
+    (void)argument;
+    const TickType_t now = xTaskGetTickCountFromISR();
+    if (gpio_get_level(BOARD_BUTTON_BOOT_GPIO) == 0) {
+        s_user_pressed_since = now;
+        s_user_press_seen = true;
+        s_user_release_seen = false;
+    } else if (s_user_press_seen) {
+        s_user_released_at = now;
+        s_user_release_seen = true;
+    }
+}
+
 static esp_err_t init_power_button_interrupt(void)
 {
     esp_err_t result = gpio_install_isr_service(0);
@@ -86,6 +104,14 @@ static esp_err_t init_power_button_interrupt(void)
                                            GPIO_INTR_NEGEDGE),
                         TAG, "POWER interrupt type");
     return gpio_isr_handler_add(BOARD_BUTTON_POWER_GPIO, power_button_isr, NULL);
+}
+
+static esp_err_t init_user_button_interrupt(void)
+{
+    ESP_RETURN_ON_ERROR(gpio_set_intr_type(BOARD_BUTTON_BOOT_GPIO,
+                                           GPIO_INTR_ANYEDGE),
+                        TAG, "USER interrupt type");
+    return gpio_isr_handler_add(BOARD_BUTTON_BOOT_GPIO, user_button_isr, NULL);
 }
 
 static void ota_progress(int downloaded, int total)
@@ -314,6 +340,69 @@ static bool boot_button_held_for_provisioning(bool startup_press_detected,
     return false;
 }
 
+typedef enum {
+    USER_BUTTON_NONE,
+    USER_BUTTON_PAGE,
+    USER_BUTTON_PROVISION,
+} user_button_action_t;
+
+static void clear_user_button_state(void)
+{
+    s_user_press_seen = false;
+    s_user_release_seen = false;
+}
+
+static user_button_action_t take_user_button_action(void)
+{
+    if (!s_user_press_seen) return USER_BUTTON_NONE;
+
+    const TickType_t pressed_since = s_user_pressed_since;
+    if (!s_user_release_seen &&
+        gpio_get_level(BOARD_BUTTON_BOOT_GPIO) == 0) {
+        while (gpio_get_level(BOARD_BUTTON_BOOT_GPIO) == 0) {
+            if ((xTaskGetTickCount() - pressed_since) >=
+                pdMS_TO_TICKS(PROVISION_HOLD_MS)) {
+                clear_user_button_state();
+                return USER_BUTTON_PROVISION;
+            }
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+        }
+    }
+
+    const TickType_t released_at = s_user_release_seen ?
+        s_user_released_at : xTaskGetTickCount();
+    clear_user_button_state();
+    const TickType_t duration = released_at - pressed_since;
+    if (duration < pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
+        return USER_BUTTON_NONE;
+    }
+    return duration >= pdMS_TO_TICKS(PROVISION_HOLD_MS) ?
+        USER_BUTTON_PROVISION : USER_BUTTON_PAGE;
+}
+
+static user_button_action_t handle_user_button(void)
+{
+    const user_button_action_t action = take_user_button_action();
+    if (action == USER_BUTTON_PAGE) {
+        s_state.page = (s_state.page + 1U) % 2U;
+        ESP_LOGI(TAG, "USER interaction: selected page %u; refreshing all data",
+                 (unsigned)(s_state.page + 1U));
+    } else if (action == USER_BUTTON_PROVISION) {
+        ESP_LOGI(TAG, "USER held for five seconds: starting Wi-Fi provisioning");
+        const esp_err_t result = provisioning_run();
+        if (result == ESP_OK) {
+            provisioning_completed();
+        } else {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(result);
+        }
+        while (gpio_get_level(BOARD_BUTTON_BOOT_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+        }
+        clear_user_button_state();
+    }
+    return action;
+}
+
 static bool wait_for_next_cycle(time_t now)
 {
     epaper_shutdown();
@@ -335,10 +424,13 @@ static bool wait_for_next_cycle(time_t now)
         }
         force_sleep = true;
     }
+    if (!force_sleep) {
+        const user_button_action_t action = handle_user_button();
+        if (action == USER_BUTTON_PAGE) return true;
+        if (action == USER_BUTTON_PROVISION) return false;
+    }
     if (!force_sleep && usb_serial_jtag_is_connected()) {
         ESP_LOGI(TAG, "USB host connected: staying awake; console remains available");
-        bool button_pressed_before = false;
-        TickType_t pressed_since = 0;
         while (usb_serial_jtag_is_connected()) {
             if (device_console_take_provision_request()) {
                 ESP_LOGI(TAG, "console request: starting Wi-Fi provisioning");
@@ -367,33 +459,9 @@ static bool wait_for_next_cycle(time_t now)
                 force_sleep = true;
                 break;
             }
-            const bool button_pressed = gpio_get_level(BOARD_BUTTON_BOOT_GPIO) == 0;
-            if (button_pressed && !button_pressed_before) {
-                vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
-                if (gpio_get_level(BOARD_BUTTON_BOOT_GPIO) == 0) {
-                    button_pressed_before = true;
-                    pressed_since = xTaskGetTickCount();
-                }
-            } else if (button_pressed && button_pressed_before &&
-                       (xTaskGetTickCount() - pressed_since) >=
-                           pdMS_TO_TICKS(PROVISION_HOLD_MS)) {
-                ESP_LOGI(TAG, "BOOT held for five seconds: starting Wi-Fi provisioning");
-                const esp_err_t result = provisioning_run();
-                if (result == ESP_OK) {
-                    provisioning_completed();
-                } else {
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(result);
-                }
-                while (gpio_get_level(BOARD_BUTTON_BOOT_GPIO) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
-                }
-                return false;
-            } else if (!button_pressed && button_pressed_before) {
-                s_state.page = (s_state.page + 1U) % 2U;
-                ESP_LOGI(TAG, "BOOT interaction: selected page %u; refreshing all data",
-                         (unsigned)(s_state.page + 1U));
-                return true;
-            }
+            const user_button_action_t action = handle_user_button();
+            if (action == USER_BUTTON_PAGE) return true;
+            if (action == USER_BUTTON_PROVISION) return false;
             vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
         }
         if (!force_sleep) {
@@ -507,6 +575,9 @@ void app_main(void)
         ESP_LOGI(TAG, "BOOT wake: selected page %u and scheduled display refresh",
                  (unsigned)(s_state.page + 1U));
     }
+
+    clear_user_button_state();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(init_user_button_interrupt());
 
     while (true) {
     const bool transmit_for_manual_wakeup = manual_button_wakeup;
