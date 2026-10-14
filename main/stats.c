@@ -57,7 +57,9 @@ static bool record_valid(const stats_record_t *record)
 {
     if (record->magic != STATS_RECORD_MAGIC ||
         (record->version != STATS_LEGACY_VERSION && record->version != STATS_VERSION) ||
-        record->kind < STATS_HOUR || record->kind > STATS_YEAR || record->sample_count == 0) {
+        record->kind < STATS_HOUR || record->kind > STATS_BATTERY ||
+        (record->kind == STATS_BATTERY && record->version != STATS_VERSION) ||
+        record->sample_count == 0) {
         return false;
     }
     stats_record_t copy = *record;
@@ -391,6 +393,14 @@ esp_err_t stats_add_sample_with_battery(stats_runtime_t *runtime, time_t timesta
     }
     bucket_add(&runtime->hour, temperature_c, humidity_pct, battery_mv, 1,
                temperature_c, temperature_c);
+    if (isfinite(battery_mv) && battery_mv > 0.0f) {
+        stats_bucket_t battery_sample;
+        bucket_reset(&battery_sample, timestamp);
+        bucket_add(&battery_sample, temperature_c, humidity_pct, battery_mv, 1,
+                   temperature_c, temperature_c);
+        ESP_RETURN_ON_ERROR(storage_append(runtime, &battery_sample, STATS_BATTERY),
+                            TAG, "battery sample append");
+    }
     return ESP_OK;
 }
 
@@ -627,21 +637,35 @@ uint8_t stats_battery_chart(const stats_runtime_t *runtime, time_t now,
     const time_t oldest_allowed = now -
         (time_t)MAX_BATTERY_HISTORY_DAYS * SECONDS_PER_DAY;
     time_t earliest = 0;
+    time_t first_battery_sample = 0;
+    time_t earliest_legacy_hour = 0;
 
     for (uint32_t age = 0; age < record_count; ++age) {
         const uint32_t slot = (runtime->flash_head + flash_capacity - 1U - age) % flash_capacity;
         stats_record_t record;
         if (esp_partition_read(s_partition, (size_t)slot * sizeof(record),
                                &record, sizeof(record)) != ESP_OK) break;
-        if (!record_valid(&record) || record.kind != STATS_HOUR ||
-            record.battery_avg_mv == 0) continue;
+        if (!record_valid(&record) || record.battery_avg_mv == 0) continue;
         const time_t record_start = (time_t)record.period_start;
-        if (record_start >= oldest_allowed && record_start <= now &&
-            (!earliest || record_start < earliest)) {
-            earliest = record_start;
+        if (record_start < oldest_allowed || record_start > now) continue;
+        if (record.kind == STATS_BATTERY &&
+            (!first_battery_sample || record_start < first_battery_sample)) {
+            first_battery_sample = record_start;
+        } else if (record.kind == STATS_HOUR &&
+                   (!earliest_legacy_hour || record_start < earliest_legacy_hour)) {
+            earliest_legacy_hour = record_start;
         }
     }
-    if (runtime->hour.sample_count && runtime->hour.battery_mv_sum > 0.0 &&
+
+    const time_t first_battery_hour = first_battery_sample ?
+        period_start(first_battery_sample, STATS_HOUR) : 0;
+    earliest = first_battery_sample;
+    if (earliest_legacy_hour &&
+        (!first_battery_sample || earliest_legacy_hour < first_battery_hour)) {
+        earliest = earliest_legacy_hour;
+    }
+    if (!first_battery_sample && runtime->hour.sample_count &&
+        runtime->hour.battery_mv_sum > 0.0 &&
         (!earliest || runtime->hour.period_start < earliest)) {
         earliest = runtime->hour.period_start;
     }
@@ -684,9 +708,12 @@ uint8_t stats_battery_chart(const stats_runtime_t *runtime, time_t now,
         stats_record_t record;
         if (esp_partition_read(s_partition, (size_t)slot * sizeof(record),
                                &record, sizeof(record)) != ESP_OK) break;
-        if (!record_valid(&record) || record.kind != STATS_HOUR ||
-            record.battery_avg_mv == 0) continue;
+        if (!record_valid(&record) || record.battery_avg_mv == 0) continue;
         const time_t record_start = (time_t)record.period_start;
+        const bool dedicated_sample = record.kind == STATS_BATTERY;
+        const bool legacy_hour = record.kind == STATS_HOUR &&
+            (!first_battery_sample || record_start < first_battery_hour);
+        if (!dedicated_sample && !legacy_hour) continue;
         if (record_start < range_start || record_start >= range_end) continue;
         const uint8_t index = (uint8_t)((record_start - range_start) /
                                         bucket_seconds);
@@ -695,7 +722,8 @@ uint8_t stats_battery_chart(const stats_runtime_t *runtime, time_t now,
         samples[index] += record.sample_count;
     }
 
-    if (runtime->hour.sample_count && runtime->hour.battery_mv_sum > 0.0 &&
+    if (!first_battery_sample && runtime->hour.sample_count &&
+        runtime->hour.battery_mv_sum > 0.0 &&
         runtime->hour.period_start >= range_start &&
         runtime->hour.period_start < range_end) {
         const uint8_t index = (uint8_t)((runtime->hour.period_start - range_start) /

@@ -12,6 +12,7 @@ typedef enum {
     STATS_WEEK,
     STATS_MONTH,
     STATS_YEAR,
+    STATS_BATTERY,
 } stats_kind_t;
 
 typedef struct {
