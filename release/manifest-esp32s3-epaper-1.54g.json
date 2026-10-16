@@ -1,0 +1,6 @@
+{
+  "board": "waveshare-esp32-s3-epaper-1.54g",
+  "version": "0.1.16",
+  "url": "https://github.com/zer0g/climacarta/releases/download/v0.1.16/climacarta-esp32s3.bin",
+  "sha256": "0205702ed3bde8b52394e6025a97cf1d2eb689139f6c48eec859f21fa306f113"
+}

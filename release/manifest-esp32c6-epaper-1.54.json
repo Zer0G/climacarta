@@ -1,0 +1,6 @@
+{
+  "board": "waveshare-esp32-c6-epaper-1.54",
+  "version": "0.1.16",
+  "url": "https://github.com/zer0g/climacarta/releases/download/v0.1.16/climacarta-esp32c6.bin",
+  "sha256": "a668ead64ce5291351f72b77f1d6bda15d33f6391b3adf03a0b35d241cf658ee"
+}

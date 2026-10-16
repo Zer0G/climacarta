@@ -28,7 +28,7 @@ automatic Home Assistant integration.
 - MQTT command reception;
 - Home Assistant MQTT auto-discovery;
 - deep sleep with timer and Power-button wake-up;
-- temporary active window when connected to a USB host;
+- active USB mode with complete sensor, display, and MQTT updates every 60 seconds;
 - battery percentage calculated from the measured constant-load discharge table,
   interpolated between 2810 mV (0%) and 4160 mV (100%);
 - board-specific low-power control for the C6 and S3 variants.
@@ -137,7 +137,9 @@ NVS and allow compiled defaults to be used again.
 6. At a periodic slot, or after a manual button wake-up, it connects to Wi-Fi
    and publishes the updated MQTT data.
 7. It refreshes the display.
-8. It enters deep sleep, except for the console window available while a USB host is connected.
+8. It enters deep sleep, except while a USB host is connected. In USB mode it
+   starts a complete new measurement, display refresh, and MQTT publication
+   every 60 seconds, measured from the start of the preceding cycle.
 
 The statistics page plots battery voltage on a fixed vertical scale from 2800
 to 4200 mV. The X span grows with the available history: 24 hourly buckets for
@@ -187,7 +189,7 @@ climacarta/broadcast/command
 An OTA broadcast must include a version newer than the installed firmware:
 
 ~~~json
-{"command":"ota_install","version":"0.1.15"}
+{"command":"ota_install","version":"0.1.16"}
 ~~~
 
 The retained request can remain on the broker: devices that already run the

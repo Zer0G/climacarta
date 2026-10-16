@@ -42,6 +42,7 @@
 #define PROVISION_HOLD_MS 5000
 #define POWER_OTA_HOLD_MS 10000
 #define USB_CONSOLE_WINDOW_SECONDS 30
+#define USB_REFRESH_INTERVAL_SECONDS 60
 
 typedef struct {
     uint32_t magic;
@@ -346,6 +347,12 @@ typedef enum {
     USER_BUTTON_PROVISION,
 } user_button_action_t;
 
+typedef enum {
+    CYCLE_TRIGGER_SCHEDULED,
+    CYCLE_TRIGGER_MANUAL,
+    CYCLE_TRIGGER_USB,
+} cycle_trigger_t;
+
 static void clear_user_button_state(void)
 {
     s_user_press_seen = false;
@@ -403,7 +410,7 @@ static user_button_action_t handle_user_button(void)
     return action;
 }
 
-static bool wait_for_next_cycle(time_t now)
+static cycle_trigger_t wait_for_next_cycle(time_t now, TickType_t cycle_started_at)
 {
     epaper_shutdown();
     network_disconnect();
@@ -420,17 +427,18 @@ static bool wait_for_next_cycle(time_t now)
             while (gpio_get_level(BOARD_BUTTON_POWER_GPIO) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
             }
-            return false;
+            return CYCLE_TRIGGER_SCHEDULED;
         }
         force_sleep = true;
     }
     if (!force_sleep) {
         const user_button_action_t action = handle_user_button();
-        if (action == USER_BUTTON_PAGE) return true;
-        if (action == USER_BUTTON_PROVISION) return false;
+        if (action == USER_BUTTON_PAGE) return CYCLE_TRIGGER_MANUAL;
+        if (action == USER_BUTTON_PROVISION) return CYCLE_TRIGGER_SCHEDULED;
     }
     if (!force_sleep && usb_serial_jtag_is_connected()) {
-        ESP_LOGI(TAG, "USB host connected: staying awake; console remains available");
+        ESP_LOGI(TAG, "USB host connected: staying awake; full refresh every %d seconds",
+                 USB_REFRESH_INTERVAL_SECONDS);
         while (usb_serial_jtag_is_connected()) {
             if (device_console_take_provision_request()) {
                 ESP_LOGI(TAG, "console request: starting Wi-Fi provisioning");
@@ -440,7 +448,7 @@ static bool wait_for_next_cycle(time_t now)
                 } else {
                     ESP_ERROR_CHECK_WITHOUT_ABORT(result);
                 }
-                return false;
+                return CYCLE_TRIGGER_SCHEDULED;
             }
             if (s_power_sleep_requested ||
                 gpio_get_level(BOARD_BUTTON_POWER_GPIO) == 0) {
@@ -450,7 +458,7 @@ static bool wait_for_next_cycle(time_t now)
                     while (gpio_get_level(BOARD_BUTTON_POWER_GPIO) == 0) {
                         vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
                     }
-                    return false;
+                    return CYCLE_TRIGGER_SCHEDULED;
                 }
                 ESP_LOGI(TAG, "POWER pressed while USB is connected: entering deep sleep");
                 while (gpio_get_level(BOARD_BUTTON_POWER_GPIO) == 0) {
@@ -460,8 +468,13 @@ static bool wait_for_next_cycle(time_t now)
                 break;
             }
             const user_button_action_t action = handle_user_button();
-            if (action == USER_BUTTON_PAGE) return true;
-            if (action == USER_BUTTON_PROVISION) return false;
+            if (action == USER_BUTTON_PAGE) return CYCLE_TRIGGER_MANUAL;
+            if (action == USER_BUTTON_PROVISION) return CYCLE_TRIGGER_SCHEDULED;
+            if (xTaskGetTickCount() - cycle_started_at >=
+                pdMS_TO_TICKS(USB_REFRESH_INTERVAL_SECONDS * 1000U)) {
+                ESP_LOGI(TAG, "USB refresh interval elapsed: updating readings, display and MQTT");
+                return CYCLE_TRIGGER_USB;
+            }
             vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
         }
         if (!force_sleep) {
@@ -490,7 +503,7 @@ static bool wait_for_next_cycle(time_t now)
     ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(DEEP_SLEEP_WAKE_MASK,
                                                     ESP_EXT1_WAKEUP_ANY_LOW));
     esp_deep_sleep_start();
-    return false;
+    return CYCLE_TRIGGER_SCHEDULED;
 }
 
 static void enter_startup_failure_sleep(esp_err_t error)
@@ -515,8 +528,9 @@ static void enter_startup_failure_sleep(esp_err_t error)
 void app_main(void)
 {
     const uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
-    bool manual_button_wakeup =
-        (wakeup_causes & (1U << ESP_SLEEP_WAKEUP_EXT1)) != 0;
+    cycle_trigger_t cycle_trigger =
+        (wakeup_causes & (1U << ESP_SLEEP_WAKEUP_EXT1)) != 0 ?
+        CYCLE_TRIGGER_MANUAL : CYCLE_TRIGGER_SCHEDULED;
 #if BOARD_BOOT_CAN_WAKE
     const uint64_t gpio_wakeup_status = esp_sleep_get_ext1_wakeup_status();
     const bool boot_button_wakeup =
@@ -580,8 +594,10 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(init_user_button_interrupt());
 
     while (true) {
-    const bool transmit_for_manual_wakeup = manual_button_wakeup;
-    manual_button_wakeup = false;
+    const TickType_t cycle_started_at = xTaskGetTickCount();
+    const bool transmit_for_manual_wakeup = cycle_trigger == CYCLE_TRIGGER_MANUAL;
+    const bool transmit_for_usb_refresh = cycle_trigger == CYCLE_TRIGGER_USB;
+    cycle_trigger = CYCLE_TRIGGER_SCHEDULED;
     time_t now = 0;
     bool rtc_valid = board_rtc_get(&now);
     bool time_valid = rtc_valid && is_time_valid(now);
@@ -607,7 +623,7 @@ void app_main(void)
         };
         ESP_ERROR_CHECK_WITHOUT_ABORT(epaper_show(&unavailable_view));
         time(&now);
-        manual_button_wakeup = wait_for_next_cycle(now);
+        cycle_trigger = wait_for_next_cycle(now, cycle_started_at);
         continue;
     }
     float battery_voltage = 0;
@@ -670,10 +686,13 @@ void app_main(void)
         periodic_transmission_due(now, settings_get_t_sample(), update_multiplier) :
         s_state.samples_since_update >= update_multiplier);
     const bool should_transmit = network_is_configured() &&
-                                 (transmit_for_manual_wakeup || periodic_due);
+                                 (transmit_for_manual_wakeup ||
+                                  transmit_for_usb_refresh || periodic_due);
 
     if (transmit_for_manual_wakeup) {
         ESP_LOGI(TAG, "manual button wake: publishing the updated measurement");
+    } else if (transmit_for_usb_refresh) {
+        ESP_LOGI(TAG, "USB refresh: publishing the updated measurement");
     } else if (periodic_due) {
         ESP_LOGI(TAG, "periodic MQTT slot due from the 00:00 schedule");
     }
@@ -789,6 +808,6 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(epaper_show(&view));
 
     time(&now);
-    manual_button_wakeup = wait_for_next_cycle(now);
+    cycle_trigger = wait_for_next_cycle(now, cycle_started_at);
     }
 }
